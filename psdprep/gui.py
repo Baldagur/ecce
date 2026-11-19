@@ -726,6 +726,10 @@ class MainWindow(QtWidgets.QMainWindow):
         k = KIND_LABEL.get(L.kind(), "")
         if k and L.kind() != "group":
             parts.append(k)
+        if L.unrendered:
+            parts.append(L.unrendered)
+        if L.fill_opacity < 255:
+            parts.append(f"fill {round(L.fill_opacity / 2.55)}%")
         if L.has_effects():
             parts.append("FX not rendered")
         if L.mask is not None and L.mask.data is not None:
@@ -873,22 +877,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStatusTip(src)
         self.statusBar().showMessage(f"Preview: {src}" + (f" · 1/{self.scale} scale" if self.scale > 1 else ""))
 
+    PREVIEW_CACHE_BYTES = 1 << 30      # converted preview layers kept in memory (8-bit)
+
     def _cached_rgb(self, conv):
+        """Colour-converted preview pixels per layer, stored 8-bit (display
+        precision) in an LRU with a memory budget."""
+        from collections import OrderedDict
+        if not isinstance(self.rgb_cache, OrderedDict):
+            self.rgb_cache = OrderedDict()
+        cache = self.rgb_cache
         nc = self.doc.color_channels
         maxv = self.doc.max_value
 
         def get(L, src):
             key = id(L)
-            if key not in self.rgb_cache:
-                if not all(c in L.channels for c in range(nc)):
-                    self.rgb_cache[key] = None
-                else:
-                    chans = [np.ascontiguousarray(L.channels[c][src]) for c in range(nc)]
-                    if conv is not None:
-                        self.rgb_cache[key] = conv.to_rgb_float(chans)
-                    else:
-                        self.rgb_cache[key] = np.stack(chans[:3], -1).astype(np.float32) / maxv
-            return self.rgb_cache[key]
+            if key in cache:
+                cache.move_to_end(key)
+                v = cache[key]
+                return None if v is None else v.astype(np.float32) * (1 / 255.0)
+            if not all(c in L.channels for c in range(nc)):
+                cache[key] = None
+                return None
+            chans = [np.ascontiguousarray(L.channels[c][src]) for c in range(nc)]
+            if conv is not None:
+                rgb = conv.to_rgb_float(chans)
+            else:
+                rgb = np.stack(chans[:3], -1).astype(np.float32) / maxv
+            cache[key] = np.clip(rgb * 255 + 0.5, 0, 255).astype(np.uint8)
+            used = sum(v.nbytes for v in cache.values() if v is not None)
+            while used > self.PREVIEW_CACHE_BYTES and len(cache) > 1:
+                _, old = cache.popitem(last=False)
+                used -= old.nbytes if old is not None else 0
+            return rgb
         return get
 
     @staticmethod
@@ -928,11 +948,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          "Photoshop (*.psd)")
             if not p:
                 return
+            chosen = p
             if not p.lower().endswith((".psd", ".psb")):
                 p += ".psd"
             if naming.is_same_file(p, self.path):
                 QtWidgets.QMessageBox.warning(self, "PSD Prep", "Choose a new name — the original "
                                               "file is never overwritten.")
+                return
+            if not self._ok_to_replace(p, chosen):
                 return
             s.out_psd = p
             stem = os.path.splitext(p)[0]
@@ -942,15 +965,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 "PNG (*.png);;TIFF (*.tif *.tiff)" if fmt == "PNG" else "TIFF (*.tif *.tiff);;PNG (*.png)")
             if not p:
                 return
+            chosen = p
             if not p.lower().endswith((".png", ".tif", ".tiff")):
                 p += ext
             if naming.is_same_file(p, self.path):
                 QtWidgets.QMessageBox.warning(self, "PSD Prep", "The original file is never overwritten.")
                 return
+            if not self._ok_to_replace(p, chosen):
+                return
             s.out_flat = p
             self.settings.setValue("fmt", fmt)
         self.settings.setValue("out_dir", os.path.dirname(s.out_psd or s.out_flat))
+        s.overwrite = True          # every existing target was confirmed above
         self._run(process, self.doc, s, on_done=self._exported)
+
+    def _ok_to_replace(self, path, chosen):
+        """The file dialog only confirms the exact name typed; if we added the
+        extension, ask ourselves before replacing an existing file."""
+        if not os.path.exists(path) or path == chosen:
+            return True
+        btn = QtWidgets.QMessageBox.question(
+            self, "PSD Prep", f"{os.path.basename(path)} already exists.\nReplace it?")
+        return btn == E(QtWidgets.QMessageBox, "StandardButton", "Yes")
 
     def _exported(self, res):
         files = res.get("written") or [res[k] for k in ("psd", "flat") if res.get(k)]
@@ -1096,6 +1132,8 @@ def _install_crash_handlers():
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     _install_crash_handlers()
+    from .desktop import auto_register
+    auto_register()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(argv)
     app.setApplicationName("PSD Prep")
     app.setStyle("Fusion")

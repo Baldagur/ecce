@@ -33,6 +33,7 @@ class Settings:
     source_path: Optional[str] = None                 # original file: never written to
     artboard: Optional[Artboard] = None               # export just this artboard
     artboard_transparent: bool = False                # ignore the artboard's background colour
+    overwrite: bool = False                           # allow replacing existing outputs (never the original)
 
 
 def make_converter(doc: PSD, s: Settings) -> ops.ColorConverter:
@@ -77,6 +78,10 @@ def use_saved_composite(doc: PSD, s: Settings) -> bool:
 def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = None) -> dict:
     result = {"warnings": []}
     guard(s.source_path, [s.out_psd, s.out_flat])
+    if not s.overwrite:
+        for p in (s.out_psd, s.out_flat):
+            if p and os.path.exists(p):
+                raise FileExistsError(f"{p} already exists (not overwritten)")
     work = edited_doc(doc, s)
     conv = make_converter(work, s)
     saved = use_saved_composite(doc, s)
@@ -102,6 +107,9 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
         fx = [L.name for L in work.layers if L.has_effects() and L.visible]
         if fx:
             result["warnings"].append("Layer styles not rendered: " + ", ".join(fx[:6]))
+        unr = [f"{L.name} ({L.unrendered})" for L in work.layers if L.unrendered and L.visible]
+        if unr:
+            result["warnings"].append("Not drawn: " + ", ".join(unr[:6]))
         adj = [L.name for L in work.layers if L.kind() == "adjustment" and L.visible]
         if adj:
             result["warnings"].append("Adjustment layers ignored: " + ", ".join(adj[:6]))

@@ -22,6 +22,7 @@ if [ -n "$gs_cmyk" ] && [ ! -f profiles/default_cmyk.icc ]; then
 fi
 
 /tmp/venv/bin/python tests/test_roundtrip.py
+/tmp/venv/bin/python tests/test_review_fixes.py
 /tmp/venv/bin/python build.py
 cd dist && tar -czf PSDPrep-linux-x86_64.tar.gz PSDPrep
 echo "Built dist/PSDPrep-linux-x86_64.tar.gz"

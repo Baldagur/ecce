@@ -44,6 +44,7 @@ args = [
     "--hidden-import", "psdprep.gui",
     "--hidden-import", "psdprep.selftest",
     "--hidden-import", "psdprep.fixtures",
+    "--hidden-import", "psdprep.desktop",
     "--hidden-import", "psdprep._build_stamp",
     "--hidden-import", "PIL.ImageCms",
     *sum((["--exclude-module", m] for m in (
@@ -74,14 +75,12 @@ for p in (ROOT / "profiles").glob("*"):
 shutil.copy2(ROOT / "README.md", dist / "README.md")
 
 if not WIN and not MAC:
-    # Double-clickable launcher for file managers (GNOME: right-click > Allow Launching once)
-    desktop = dist / "PSD Prep.desktop"
-    desktop.write_text(
-        "[Desktop Entry]\nType=Application\nName=PSD Prep\n"
-        "Comment=Remove layers, crop and convert PSD files\n"
-        + r'Exec=sh -c "cd \\"\\$(dirname \\"%k\\")\\" && exec ./' + NAME + '"' + "\n"
-        "Icon=image-x-generic\nTerminal=false\nCategories=Graphics;\n")
-    desktop.chmod(desktop.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # A .desktop file needs absolute paths, so it is created on the target
+    # machine: the app registers itself in the Activities menu on first run,
+    # and this script also puts a trusted shortcut on the Desktop.
+    sh = dist / "Install shortcut.sh"
+    sh.write_text('#!/bin/sh\ncd "$(dirname "$0")" && exec ./' + NAME + ' install-shortcut\n')
+    sh.chmod(0o755)
     sh = dist / "Run PSD Prep.sh"
     sh.write_text('#!/bin/sh\ncd "$(dirname "$0")" && exec ./' + NAME + ' "$@"\n')
     sh.chmod(0o755)

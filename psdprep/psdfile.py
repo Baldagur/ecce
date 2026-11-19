@@ -44,7 +44,7 @@ ADJUST_KEYS = {b"levl", b"curv", b"brit", b"blnc", b"hue2", b"hue ", b"selc",
 FILL_KEYS = {b"SoCo", b"GdFl", b"PtFl"}
 # Tagged blocks we copy into the output as-is (safe after edits).
 _KEEP_KEYS = {b"lyid", b"clbl", b"infx", b"knko", b"lspf", b"lclr", b"fxrp",
-              b"artb", b"artd", b"abdd"}  # artboards (dropped by the pipeline after a crop)
+              b"artb", b"artd", b"abdd", b"iOpa"}  # artboards (dropped by the pipeline after a crop)
 
 
 class PSDError(Exception):
@@ -91,6 +91,7 @@ class Layer:
     section: int = SECTION_NONE
     section_blend: Optional[str] = None
     tagged: list = field(default_factory=list)     # [(sig, key, data)]
+    unrendered: str = ""                           # why the content can't be drawn
 
     # -- convenience -------------------------------------------------------
     @property
@@ -133,6 +134,17 @@ class Layer:
         if k & FILL_KEYS:
             return "fill"
         return "pixel"
+
+    @property
+    def fill_opacity(self) -> int:
+        """Photoshop 'Fill' (0-255): scales the layer's own pixels, not its FX."""
+        for _, k, d in self.tagged:
+            if k == b"iOpa" and len(d) >= 1:
+                return d[0]
+        return 255
+
+    def has_vector_mask(self) -> bool:
+        return bool(self.keys() & {b"vmsk", b"vsms"})
 
     def has_effects(self) -> bool:
         return bool(self.keys() & FX_KEYS)
@@ -203,12 +215,13 @@ class _Reader:
         self.p = 0
         self.psb = psb
 
-    def read(self, n: int) -> bytes:
+    def read(self, n: int):
+        """bytes for small reads; a zero-copy memoryview slice for big ones."""
         if self.p + n > len(self.b):
             raise PSDError("Unexpected end of file")
         r = self.b[self.p:self.p + n]
         self.p += n
-        return r
+        return bytes(r) if (n <= 256 and isinstance(r, memoryview)) else r
 
     def u8(self):
         return self.read(1)[0]
@@ -233,7 +246,15 @@ class _Reader:
         return self.u64() if self.psb else self.u32()
 
 
-def _unpackbits(data: bytes, rowbytes: int, rows: int) -> np.ndarray:
+def _fit(data, n: int) -> np.ndarray:
+    """First n bytes of data as uint8 (zero padded if short), no copy if possible."""
+    a = np.frombuffer(data, np.uint8, count=min(n, len(data)))
+    if a.size < n:
+        a = np.concatenate([a, np.zeros(n - a.size, np.uint8)])
+    return a
+
+
+def _unpackbits(data, rowbytes: int, rows: int) -> np.ndarray:
     """Decode a concatenation of PackBits rows into (rows, rowbytes) uint8."""
     if rows == 0 or rowbytes == 0:
         return np.zeros((rows, rowbytes), np.uint8)
@@ -244,6 +265,7 @@ def _unpackbits(data: bytes, rowbytes: int, rows: int) -> np.ndarray:
     except Exception:
         pass
     # Pure python fallback (slow, but always works).
+    data = bytes(data)
     out = bytearray()
     i, n = 0, len(data)
     need = rowbytes * rows
@@ -256,8 +278,7 @@ def _unpackbits(data: bytes, rowbytes: int, rows: int) -> np.ndarray:
         elif h > 128:
             out += data[i:i + 1] * (257 - h)
             i += 1
-    out = bytes(out[:need]).ljust(need, b"\0")
-    return np.frombuffer(out, np.uint8).reshape(rows, rowbytes).copy()
+    return _fit(bytes(out[:need]), need).reshape(rows, rowbytes).copy()
 
 
 def _bytes_to_pixels(raw: np.ndarray, w: int, h: int, depth: int) -> np.ndarray:
@@ -290,13 +311,13 @@ def _decode_channel(data: bytes, w: int, h: int, depth: int, psb: bool,
     if w == 0 or h == 0:
         return np.zeros((h, w), {8: np.uint8, 16: np.uint16, 32: np.float32}.get(depth, np.uint8))
     if compression == 0:
-        raw = np.frombuffer(data[:rb * h].ljust(rb * h, b"\0"), np.uint8).reshape(h, rb)
+        raw = _fit(data, rb * h).reshape(h, rb)
     elif compression == 1:
         csize = 4 if psb else 2
         raw = _unpackbits(data[h * csize:], rb, h)
     elif compression in (2, 3):
         dec = zlib.decompress(data)
-        raw = np.frombuffer(dec[:rb * h].ljust(rb * h, b"\0"), np.uint8).reshape(h, rb)
+        raw = _fit(dec, rb * h).reshape(h, rb)
         if compression == 3:
             if depth == 8:
                 raw = np.cumsum(raw, axis=1, dtype=np.uint8)
@@ -330,7 +351,10 @@ def _parse_tagged(data: bytes, psb: bool) -> list:
             break
         key = r.read(4)
         n = r.u64() if (psb and key in _PSB_LONG_KEYS) else r.u32()
-        out.append((sig, key, r.read(min(n, len(data) - r.p))))
+        blk = r.read(min(n, len(data) - r.p))
+        if key not in (b"Lr16", b"Lr32", b"Layr"):
+            blk = bytes(blk)
+        out.append((sig, key, blk))
     return out
 
 
@@ -343,6 +367,7 @@ def read_psd(path_or_bytes, load_merged: bool = True) -> PSD:
     else:
         with open(path_or_bytes, "rb") as f:
             data = f.read()
+    data = memoryview(data)
 
     r = _Reader(data)
     if r.read(4) != b"8BPS":
@@ -364,7 +389,7 @@ def read_psd(path_or_bytes, load_merged: bool = True) -> PSD:
         raise PSDError(f"{doc.depth}-bit files are not supported yet (8 and 16-bit only)")
 
     n = r.u32()
-    doc.color_mode_data = r.read(n)
+    doc.color_mode_data = bytes(r.read(n))
 
     # image resources
     n = r.u32()
@@ -375,7 +400,7 @@ def read_psd(path_or_bytes, load_merged: bool = True) -> PSD:
         rid = r.u16()
         name = _read_pascal(r, 2)
         size = r.u32()
-        rdata = r.read(size)
+        rdata = bytes(r.read(size))
         if size % 2:
             r.read(1)
         doc.resources.append((rid, name, rdata))
@@ -415,11 +440,12 @@ def read_psd(path_or_bytes, load_merged: bool = True) -> PSD:
                 csize = 4 if r.psb else 2
                 raw = _unpackbits(body[h * c * csize:], rb, h * c)
             elif comp == 0:
-                need = rb * h * c
-                raw = np.frombuffer(body[:need].ljust(need, b"\0"), np.uint8).reshape(h * c, rb)
+                raw = _fit(body, rb * h * c).reshape(h * c, rb)
             else:
                 raw = None
-                chans = [_decode_channel(body, w, h, doc.depth, r.psb, comp)]
+                # ZIP: one stream for all channels; prediction restarts every row
+                tall = _decode_channel(body, w, h * c, doc.depth, r.psb, comp)
+                chans = [tall[i * h:(i + 1) * h] for i in range(c)]
             if raw is not None:
                 chans = [_bytes_to_pixels(raw[i * h:(i + 1) * h], w, h, doc.depth) for i in range(c)]
             keep = doc.color_channels + (1 if doc.merged_has_alpha and c > doc.color_channels else 0)
@@ -452,12 +478,27 @@ def _read_layer_info(r: _Reader, doc: PSD) -> int:
         # mask
         mlen = r.u32()
         mend = r.p + mlen
+        real = None
         if mlen >= 18:
             m = Mask()
             m.top, m.left, m.bottom, m.right = r.i32(), r.i32(), r.i32(), r.i32()
             m.default_color = r.u8()
             m.flags = r.u8()
             L.mask = m
+            if mlen >= 36:
+                try:
+                    if m.flags & 16:                     # mask parameters
+                        params = r.u8()
+                        for bit, size in ((1, 1), (2, 8), (4, 1), (8, 8)):
+                            if params & bit:
+                                r.read(size)
+                    if mend - r.p >= 18:
+                        real = Mask()
+                        real.flags = r.u8()
+                        real.default_color = r.u8()
+                        real.top, real.left, real.bottom, real.right = r.i32(), r.i32(), r.i32(), r.i32()
+                except PSDError:
+                    real = None
         r.p = mend
         blen = r.u32()
         L.blending_ranges = r.read(blen)
@@ -475,16 +516,18 @@ def _read_layer_info(r: _Reader, doc: PSD) -> int:
                 if len(d) >= 12:
                     L.section_blend = d[8:12].decode("latin-1")
         L.tagged = [t for t in L.tagged if t[1] not in (b"luni", b"lsct", b"lsdk")]
-        records.append((L, chinfo))
+        records.append((L, chinfo, real))
 
     # channel image data
-    for L, chinfo in records:
+    for L, chinfo, real in records:
         for cid, clen in chinfo:
             chunk = r.read(clen)
             if cid == -2 and L.mask is not None:
                 w, h = L.mask.width, L.mask.height
-            elif cid < -2:
-                continue  # real user mask / vector mask extras: not used
+            elif cid == -3 and real is not None:
+                w, h = real.width, real.height
+            elif cid < -1:
+                continue
             else:
                 w, h = L.width, L.height
             try:
@@ -492,50 +535,153 @@ def _read_layer_info(r: _Reader, doc: PSD) -> int:
             except Exception:
                 arr = np.zeros((h, w), doc.dtype)
             if cid == -2:
-                if L.mask is not None:
-                    L.mask.data = arr
+                L.mask.data = arr
+            elif cid == -3:
+                real.data = arr
             else:
                 L.channels[cid] = arr
+        if L.mask is not None and L.mask.data is None:
+            L.mask.data = np.zeros((0, 0), doc.dtype)
+        if real is not None and real.data is not None and L.mask is not None:
+            L.mask = combine_masks(L.mask, real, doc.max_value, doc.dtype)
+        _materialize_fill(L, doc)
         doc.layers.append(L)
     return count
+
+
+def _fill_color(info: dict, doc: PSD) -> Optional[list]:
+    """Descriptor colour -> raw channel values (0..1, PSD conventions) for doc.mode."""
+    c = info.get("Clr ")
+    if not isinstance(c, dict):
+        return None
+    try:
+        if "Rd  " in c:
+            rgb = [float(c[k]) / 255.0 for k in ("Rd  ", "Grn ", "Bl  ")]
+        elif "Cyn " in c:
+            cmyk = [float(c[k]) / 100.0 for k in ("Cyn ", "Mgnt", "Ylw ", "Blck")]
+            if doc.mode == MODE_CMYK:
+                return [1 - v for v in cmyk]                 # stored inverted
+            rgb = [(1 - x) * (1 - cmyk[3]) for x in cmyk[:3]]
+        elif "Gry " in c:
+            g = 1 - float(c["Gry "]) / 100.0
+            rgb = [g, g, g]
+        else:
+            return None
+    except (TypeError, ValueError, KeyError):
+        return None
+    rgb = [min(1.0, max(0.0, v)) for v in rgb]
+    if doc.mode == MODE_RGB:
+        return rgb
+    if doc.mode == MODE_CMYK:
+        k = 1 - max(rgb)
+        cmy = [(1 - v - k) / (1 - k) if k < 1 else 0 for v in rgb]
+        return [1 - v for v in cmy + [k]]
+    if doc.mode == MODE_GRAY:
+        return [0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]]
+    return None
+
+
+def _materialize_fill(L: Layer, doc: PSD):
+    """Solid-colour fill layers often carry no pixels: draw them as pixels.
+    Shape layers (vector mask) and gradient/pattern fills are flagged instead."""
+    keys = L.keys()
+    has_pixels = L.width > 0 and L.height > 0 and all(c in L.channels for c in range(doc.color_channels))
+    if b"SoCo" in keys and not has_pixels:
+        if L.has_vector_mask() and not (L.mask is not None and L.mask.data is not None and L.mask.data.size):
+            L.unrendered = "shape layer (vector) not rendered"
+            return
+        try:
+            from . import descriptor
+            info = descriptor.parse(next(bytes(d) for _, k, d in L.tagged if k == b"SoCo"))
+            vals = _fill_color(info, doc)
+        except Exception:
+            vals = None
+        if vals is None:
+            L.unrendered = "fill colour not readable"
+            return
+        L.top, L.left, L.bottom, L.right = 0, 0, doc.height, doc.width
+        L.channels = {i: np.full((doc.height, doc.width), round(v * doc.max_value), doc.dtype)
+                      for i, v in enumerate(vals)}
+    elif keys & {b"GdFl", b"PtFl"} and not has_pixels:
+        L.unrendered = "gradient/pattern fill not rendered"
+    elif L.has_vector_mask() and not has_pixels:
+        L.unrendered = "shape layer (vector) not rendered"
+
+
+def combine_masks(a: Mask, b: Mask, maxv: float, dtype) -> Mask:
+    """Multiply two masks (vector mask raster x pixel mask) into one pixel mask."""
+    rects = [(m.top, m.left, m.bottom, m.right) for m in (a, b) if m.width and m.height]
+    if not rects:
+        return Mask(0, 0, 0, 0, round(a.default_color * b.default_color / 255), 0,
+                    np.zeros((0, 0), dtype))
+    t = min(r[0] for r in rects); l = min(r[1] for r in rects)
+    bt = max(r[2] for r in rects); rt = max(r[3] for r in rects)
+    out = np.ones((bt - t, rt - l), np.float32)
+    for m in (a, b):
+        plane = np.full(out.shape, m.default_color / 255.0, np.float32)
+        if m.width and m.height and m.data is not None and m.data.size:
+            plane[m.top - t:m.bottom - t, m.left - l:m.right - l] = m.data.astype(np.float32) / maxv
+        if not m.disabled:
+            out *= plane
+    data = np.clip(np.rint(out * maxv), 0, maxv).astype(dtype)
+    default = round(255 * (a.default_color / 255 if not a.disabled else 1)
+                    * (b.default_color / 255 if not b.disabled else 1))
+    return Mask(t, l, bt, rt, default, 0, data)
 
 
 # ---------------------------------------------------------------------------
 # Writing helpers
 # ---------------------------------------------------------------------------
-def _packbits_row(rb: bytes, row: np.ndarray, out: bytearray):
-    n = row.size
-    if n == 0:
-        return
-    change = np.empty(n, bool)
+def _packbits_block(rows: np.ndarray) -> tuple:
+    """Vectorised PackBits of a block of byte rows (h, n) -> (counts[h], bytes).
+    Each row is encoded independently, as PSD requires."""
+    h, n = rows.shape
+    if h == 0 or n == 0:
+        return np.zeros(h, np.int64), b""
+    flat = rows.reshape(-1)
+    N = flat.size
+    change = np.empty(N, bool)
     change[0] = True
-    np.not_equal(row[1:], row[:-1], out=change[1:])
+    np.not_equal(flat[1:], flat[:-1], out=change[1:])
+    change[::n] = True                                   # runs never cross rows
     starts = np.flatnonzero(change)
-    lengths = np.diff(np.append(starts, n))
-    pos = 0
-
-    def literal(a, b):
-        while a < b:
-            m = min(128, b - a)
-            out.append(m - 1)
-            out.extend(rb[a:a + m])
-            a += m
-
-    for i in np.flatnonzero(lengths >= 3):
-        s = int(starts[i])
-        L = int(lengths[i])
-        literal(pos, s)
-        v = rb[s]
-        while L >= 2:
-            m = min(128, L)
-            out.append(257 - m)
-            out.append(v)
-            L -= m
-        if L == 1:
-            out.append(0)
-            out.append(v)
-        pos = s + int(lengths[i])
-    literal(pos, n)
+    lengths = np.diff(np.append(starts, N))
+    run_row = starts // n
+    rep = lengths >= 3
+    # segments: every repeat run alone; consecutive literal runs in a row merge
+    new = np.ones(starts.size, bool)
+    new[1:] = rep[1:] | rep[:-1] | (run_row[1:] != run_row[:-1])
+    seg_first = np.flatnonzero(new)
+    seg_start = starts[seg_first]
+    seg_len = np.add.reduceat(lengths, seg_first)
+    seg_rep = rep[seg_first]
+    seg_row = run_row[seg_first]
+    # chunks of at most 128 bytes
+    nch = (seg_len + 127) // 128
+    ch_seg = np.repeat(np.arange(seg_first.size), nch)
+    first_chunk = np.cumsum(nch) - nch
+    ch_k = np.arange(ch_seg.size) - first_chunk[ch_seg]
+    ch_start = seg_start[ch_seg] + 128 * ch_k
+    ch_size = np.minimum(128, seg_len[ch_seg] - 128 * ch_k)
+    ch_rep = seg_rep[ch_seg]
+    ch_row = seg_row[ch_seg]
+    ch_bytes = np.where(ch_rep, 2, 1 + ch_size)
+    pos = np.cumsum(ch_bytes) - ch_bytes
+    out = np.empty(int(ch_bytes.sum()), np.uint8)
+    # headers: literal m bytes -> m-1 ; repeat m (2..128) -> 257-m ; a leftover
+    # single byte of a repeat run is written as a 1-byte literal (header 0)
+    hdr = np.where(ch_rep, np.where(ch_size >= 2, 257 - ch_size, 0), ch_size - 1)
+    out[pos] = hdr.astype(np.uint8)
+    r = ch_rep
+    out[pos[r] + 1] = flat[ch_start[r]]
+    lit = ~r
+    if lit.any():
+        sz = ch_size[lit]
+        tot = int(sz.sum())
+        within = np.arange(tot) - np.repeat(np.cumsum(sz) - sz, sz)
+        out[np.repeat(pos[lit] + 1, sz) + within] = flat[np.repeat(ch_start[lit], sz) + within]
+    counts = np.bincount(ch_row, weights=ch_bytes, minlength=h).astype(np.int64)
+    return counts, out.tobytes()
 
 
 def _to_bytes_rows(arr: np.ndarray, depth: int) -> np.ndarray:
@@ -550,14 +696,16 @@ def _to_bytes_rows(arr: np.ndarray, depth: int) -> np.ndarray:
 def encode_rle(arr: np.ndarray, depth: int, psb: bool) -> tuple:
     """Return (row_counts_bytes, data_bytes) for one channel."""
     rows = _to_bytes_rows(arr, depth)
-    counts = []
-    body = bytearray()
-    for row in rows:
-        start = len(body)
-        _packbits_row(row.tobytes(), row, body)
-        counts.append(len(body) - start)
-    fmt = ">%d%s" % (len(counts), "I" if psb else "H")
-    return struct.pack(fmt, *counts), bytes(body)
+    h, n = rows.shape
+    step = max(1, (8 << 20) // max(1, n))      # ~8 MB of pixels per block
+    counts, bodies = [], []
+    for y in range(0, h, step):
+        c, b = _packbits_block(rows[y:y + step])
+        counts.append(c)
+        bodies.append(b)
+    counts = np.concatenate(counts) if counts else np.zeros(0, np.int64)
+    dt = ">u4" if psb else ">u2"
+    return counts.astype(dt).tobytes(), b"".join(bodies)
 
 
 def _channel_blob(arr: Optional[np.ndarray], depth: int, psb: bool) -> bytes:
@@ -590,125 +738,139 @@ def _default_blending_ranges(n_color: int) -> bytes:
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
-def write_psd(doc: PSD, path: str, composite: Optional[np.ndarray] = None,
-              composite_alpha: bool = False, progress=None):
-    """Write doc to path.
+_PSD_LIMIT = (1 << 32) - (1 << 24)      # stay clear of 4-byte length fields
 
-    composite: optional (C, H, W) merged image in the doc's dtype; C must be
-    color_channels (+1 if composite_alpha). Colour must already be matted
-    with white where alpha < 1 (Photoshop convention).
-    """
-    psb = doc.width > 30000 or doc.height > 30000
-    version = 2 if psb else 1
+
+def _encode_layers(doc: PSD, psb: bool, progress=None) -> list:
     nc = doc.color_channels
     color_ids = list(range(nc))
-    f = io.BytesIO()
-
-    # header
-    has_alpha = composite_alpha and composite is not None
-    nchan = nc + (1 if has_alpha else 0)
-    f.write(b"8BPS" + struct.pack(">H", version) + b"\0" * 6)
-    f.write(struct.pack(">HIIHH", nchan, doc.height, doc.width, doc.depth, doc.mode))
-    # colour mode data
-    f.write(struct.pack(">I", len(doc.color_mode_data)) + doc.color_mode_data)
-    # resources
-    res = io.BytesIO()
-    for rid, name, data in doc.resources:
-        res.write(b"8BIM" + struct.pack(">H", rid))
-        nm = bytes([len(name)]) + name
-        if len(nm) % 2:
-            nm += b"\0"
-        res.write(nm)
-        res.write(struct.pack(">I", len(data)) + data)
-        if len(data) % 2:
-            res.write(b"\0")
-    rb = res.getvalue()
-    f.write(struct.pack(">I", len(rb)) + rb)
-
-    # layer info
     total = max(1, len(doc.layers))
-    li = io.BytesIO()
-    count = len(doc.layers)
-    li.write(struct.pack(">h", -count if (has_alpha and count) else count))
-    blobs = []
+    out = []
     for idx, L in enumerate(doc.layers):
         chans = []
         if L.is_group or L.is_divider:
-            ids = [-1] + color_ids
-            for cid in ids:
-                chans.append((cid, b"\0\0"))
+            chans += [(cid, b"\0\0") for cid in [-1] + color_ids]
         else:
             for cid in ([-1] if -1 in L.channels else []) + color_ids:
                 arr = L.channels.get(cid)
                 if arr is None:
                     arr = np.zeros((L.height, L.width), doc.dtype)
                 chans.append((cid, _channel_blob(arr, doc.depth, psb)))
-            if L.mask is not None and L.mask.data is not None and L.mask.data.size:
-                chans.append((-2, _channel_blob(L.mask.data, doc.depth, psb)))
-        blobs.append(chans)
+        m = L.mask
+        if m is not None and m.width and m.height and m.data is not None and m.data.size:
+            chans.append((-2, _channel_blob(m.data, doc.depth, psb)))
+        out.append(chans)
         if progress:
             progress(idx + 1, total)
+    return out
 
-        top, left, bottom, right = ((0, 0, 0, 0) if (L.is_group or L.is_divider)
-                                    else (L.top, L.left, L.bottom, L.right))
-        li.write(struct.pack(">iiiiH", top, left, bottom, right, len(chans)))
-        for cid, blob in chans:
-            li.write(struct.pack(">h", cid))
-            li.write(struct.pack(">Q" if psb else ">I", len(blob)))
-        li.write(b"8BIM" + L.blend_mode.encode("latin-1")[:4].ljust(4))
-        li.write(struct.pack(">BBBB", L.opacity, L.clipping, L.flags & 0x1F, 0))
 
-        extra = io.BytesIO()
-        m = L.mask
-        if m is not None and m.data is not None and m.data.size:
-            extra.write(struct.pack(">IiiiiBBxx", 20, m.top, m.left, m.bottom, m.right,
-                                    m.default_color, m.flags & 0x0F))
-        else:
-            extra.write(struct.pack(">I", 0))
-        br = L.blending_ranges
-        if len(br) != 8 * (1 + nc):
-            br = _default_blending_ranges(nc)
-        extra.write(struct.pack(">I", len(br)) + br)
-        extra.write(_pascal(L.name, 4))
-        uni = L.name.encode("utf-16-be")
-        extra.write(_tag(b"luni", struct.pack(">I", len(L.name)) + uni, psb))
-        if L.section:
-            d = struct.pack(">I", L.section)
-            if L.is_group:
-                d += b"8BIM" + (L.section_blend or "pass").encode("latin-1")[:4].ljust(4)
-            extra.write(_tag(b"lsct", d, psb))
-        for sig, key, data in L.tagged:
-            if key in _KEEP_KEYS:
-                extra.write(_tag(key, data, psb, sig))
-        e = extra.getvalue()
-        li.write(struct.pack(">I", len(e)) + e)
+def _layer_record(L: Layer, chans: list, nc: int, psb: bool) -> bytes:
+    rec = io.BytesIO()
+    top, left, bottom, right = ((0, 0, 0, 0) if (L.is_group or L.is_divider)
+                                else (L.top, L.left, L.bottom, L.right))
+    rec.write(struct.pack(">iiiiH", top, left, bottom, right, len(chans)))
+    for cid, blob in chans:
+        rec.write(struct.pack(">h", cid))
+        rec.write(struct.pack(">Q" if psb else ">I", len(blob)))
+    rec.write(b"8BIM" + L.blend_mode.encode("latin-1")[:4].ljust(4))
+    rec.write(struct.pack(">BBBB", L.opacity, L.clipping, L.flags & 0x1F, 0))
 
-    for chans in blobs:
-        for _, blob in chans:
-            li.write(blob)
-    lib = li.getvalue() if doc.layers else b""
-    if len(lib) % 4:
-        lib += b"\0" * (4 - len(lib) % 4)
+    extra = io.BytesIO()
+    m = L.mask
+    if m is not None:
+        # always written (even with no pixels: a "Hide All" mask is just a
+        # default colour), so masked content stays hidden
+        has_px = bool(m.width and m.height and m.data is not None and m.data.size)
+        t, l, b, r = (m.top, m.left, m.bottom, m.right) if has_px else (0, 0, 0, 0)
+        extra.write(struct.pack(">IiiiiBBxx", 20, t, l, b, r, m.default_color, m.flags & 0x0F))
+    else:
+        extra.write(struct.pack(">I", 0))
+    br = L.blending_ranges
+    if len(br) != 8 * (1 + nc):
+        br = _default_blending_ranges(nc)
+    extra.write(struct.pack(">I", len(br)) + br)
+    extra.write(_pascal(L.name, 4))
+    uni = L.name.encode("utf-16-be")
+    extra.write(_tag(b"luni", struct.pack(">I", len(uni) // 2) + uni, psb))   # UTF-16 units
+    if L.section:
+        d = struct.pack(">I", L.section)
+        if L.is_group:
+            d += b"8BIM" + (L.section_blend or "pass").encode("latin-1")[:4].ljust(4)
+        extra.write(_tag(b"lsct", d, psb))
+    for sig, key, data in L.tagged:
+        if key in _KEEP_KEYS:
+            extra.write(_tag(key, bytes(data), psb, sig))
+    e = extra.getvalue()
+    rec.write(struct.pack(">I", len(e)) + e)
+    return rec.getvalue()
 
-    lm = io.BytesIO()
-    lm.write(struct.pack(">Q" if psb else ">I", len(lib)) + lib)
-    lm.write(struct.pack(">I", 0))  # global layer mask info
-    lmb = lm.getvalue()
-    f.write(struct.pack(">Q" if psb else ">I", len(lmb)) + lmb)
 
-    # merged composite
+def write_psd(doc: PSD, path: str, composite: Optional[np.ndarray] = None,
+              composite_alpha: bool = False, progress=None):
+    """Write doc to path (streamed to disk).
+
+    composite: optional (C, H, W) merged image in the doc's dtype; C must be
+    color_channels (+1 if composite_alpha). Colour must already be matted
+    with white where alpha < 1 (Photoshop convention).
+    Switches to PSB when the canvas is over 30000 px or the layer data would
+    not fit PSD's 4 GB length fields.
+    """
+    nc = doc.color_channels
+    has_alpha = composite_alpha and composite is not None
+    nchan = nc + (1 if has_alpha else 0)
+    psb = doc.width > 30000 or doc.height > 30000
+    blobs = _encode_layers(doc, psb, progress)
+    if not psb and sum(len(b) for ch in blobs for _, b in ch) > _PSD_LIMIT:
+        psb = True
+        blobs = _encode_layers(doc, psb, progress)
+    records = [_layer_record(L, ch, nc, psb) for L, ch in zip(doc.layers, blobs)]
+    L_LEN = ">Q" if psb else ">I"
+
     if composite is None:
         composite = np.full((nc, doc.height, doc.width), doc.max_value, doc.dtype)
-        if doc.mode == MODE_CMYK:
-            composite[:] = doc.max_value  # inverted: white = no ink
-    f.write(b"\0\1")
-    counts_all, bodies = [], []
-    for c in range(nchan):
-        counts, body = encode_rle(composite[c], doc.depth, psb)
-        counts_all.append(counts)
-        bodies.append(body)
-    f.write(b"".join(counts_all))
-    f.write(b"".join(bodies))
 
-    with open(path, "wb") as out:
-        out.write(f.getvalue())
+    count = len(doc.layers)
+    li_len = 0
+    if doc.layers:
+        li_len = 2 + sum(len(r) for r in records) + sum(len(b) for ch in blobs for _, b in ch)
+    li_pad = (-li_len) % 4
+    lm_len = (8 if psb else 4) + li_len + li_pad + 4
+
+    with open(path, "wb") as f:
+        f.write(b"8BPS" + struct.pack(">H", 2 if psb else 1) + b"\0" * 6)
+        f.write(struct.pack(">HIIHH", nchan, doc.height, doc.width, doc.depth, doc.mode))
+        f.write(struct.pack(">I", len(doc.color_mode_data)) + doc.color_mode_data)
+        res = io.BytesIO()
+        for rid, name, data in doc.resources:
+            res.write(b"8BIM" + struct.pack(">H", rid))
+            nm = bytes([len(name)]) + name
+            if len(nm) % 2:
+                nm += b"\0"
+            res.write(nm)
+            res.write(struct.pack(">I", len(data)) + data)
+            if len(data) % 2:
+                res.write(b"\0")
+        rb = res.getvalue()
+        f.write(struct.pack(">I", len(rb)) + rb)
+
+        f.write(struct.pack(L_LEN, lm_len))
+        f.write(struct.pack(L_LEN, li_len + li_pad))
+        if doc.layers:
+            f.write(struct.pack(">h", -count if has_alpha else count))
+            for r in records:
+                f.write(r)
+            del records
+            for ch in blobs:
+                for _, blob in ch:
+                    f.write(blob)
+            f.write(b"\0" * li_pad)
+        del blobs
+        f.write(struct.pack(">I", 0))  # global layer mask info
+
+        f.write(b"\0\1")
+        enc = [encode_rle(composite[c], doc.depth, psb) for c in range(nchan)]
+        for counts, _ in enc:
+            f.write(counts)
+        for _, body in enc:
+            f.write(body)

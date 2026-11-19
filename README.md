@@ -45,9 +45,12 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   from the layers.
 * When the image is rebuilt from the layers, it supports normal, multiply, screen, overlay,
   soft/hard light, darken/lighten, difference, exclusion, add, linear burn, subtract, divide,
-  dodge and burn. It also handles opacity, layer masks, clipping masks and groups. **Not
-  rendered:** layer styles (FX), adjustment layers, and the HSL modes (hue/saturation/color/
-  luminosity). The layer list flags these.
+  dodge and burn. It also handles opacity, fill opacity, layer masks (including combined
+  vector + pixel masks, as pixels), clipping masks (clipped layers take the base's opacity and
+  blend mode, and can clip to groups), groups, and solid-colour fill layers. **Not rendered:**
+  layer styles (FX), adjustment layers, shape layers drawn only by a vector path,
+  gradient/pattern fills, and the HSL modes (hue/saturation/color/luminosity). The layer list
+  and the log flag these.
 
 ### Command line (same engine)
 
@@ -60,13 +63,20 @@ PSDPrep in.psd --auto both                     # -> in_cleanup_v1.psd + .png nex
 PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>.png, _02_…
 ```
 
-## Limits (v0.1)
+## Limits (v0.2)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.
-* In the saved PSD, text layers, smart objects and fill layers are kept as pixels (they lose
-  editability). Adjustment layers and layer styles are dropped. Groups, masks, opacity, blend
-  modes, visibility and clipping are kept.
+* In the saved PSD, text layers, smart objects and solid-colour fill layers are kept as pixels
+  (they lose editability). Adjustment layers, layer styles, vector masks and vector-only shape
+  layers are dropped. Groups, pixel masks, opacity, fill opacity, blend modes, visibility and
+  clipping are kept.
+* 16-bit layers are written in the standard layer section rather than Photoshop's own `Lr16`
+  block. Other apps read this fine; it hasn't been confirmed in Photoshop yet.
+* Files with very large layer data (over ~4 GB) are written as PSB automatically.
+* With "Ask where to save", replacing an existing file always asks first. The command line
+  refuses to replace existing outputs unless you pass `--overwrite`. The original is never
+  replaced.
 * 16-bit CMYK is converted through a 4D LUT sampled from littleCMS (18 nodes per channel).
   Against the exact 8-bit path the difference is ≤ ~1.5/255.
 
@@ -85,8 +95,13 @@ Copy the file to the Rocky machine, then:
 
 ```
 tar -xzf PSDPrep-linux-x86_64.tar.gz
-PSDPrep/PSDPrep            # or double-click "PSD Prep.desktop" (first time: right-click > Allow Launching)
+PSDPrep/PSDPrep            # first run: from a terminal, or double-click "Run PSD Prep.sh"
 ```
+
+After the first run, **PSD Prep is in the Activities menu**. The app registers itself and keeps
+the entry pointing at wherever the folder lives. To also get a double-click icon on the
+Desktop, run `Install shortcut.sh` (or `PSDPrep/PSDPrep install-shortcut`). Both use absolute
+paths, so move the folder first and then run it again.
 
 Builds run on Rocky 8 and 9. The window title shows the build date and commit.
 

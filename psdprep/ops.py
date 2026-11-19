@@ -95,8 +95,12 @@ def _crop_array(arr, top, left, new_top, new_left, new_bottom, new_right):
 
 
 def crop(doc: PSD, x: int, y: int, w: int, h: int, delete_pixels: bool = True) -> PSD:
-    x = max(0, int(x)); y = max(0, int(y))
-    w = max(1, min(int(w), doc.width - x)); h = max(1, min(int(h), doc.height - y))
+    """Crop to the part of (x, y, w, h) that lies on the canvas."""
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(doc.width, int(x) + int(w)), min(doc.height, int(y) + int(h))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"Crop {x},{y} {w}x{h} is outside the {doc.width}x{doc.height} image")
+    x, y, w, h = x0, y0, x1 - x0, y1 - y0
     for L in doc.layers:
         if L.is_group or L.is_divider:
             if L.mask is not None and L.mask.data is not None:
@@ -216,6 +220,23 @@ class ColorConverter:
         self._lut = None
         if mode == MODE_GRAY:
             self.method = "gray"
+            self._gray_lut = None
+            if embedded and use_embedded and embedded[16:20] == b"GRAY":
+                try:
+                    from PIL import Image, ImageCms
+                    import io
+                    flags = 0x2000 if bpc else 0
+                    t = ImageCms.buildTransform(ImageCms.ImageCmsProfile(io.BytesIO(embedded)),
+                                                ImageCms.createProfile("sRGB"), "L", "RGB",
+                                                INTENTS.get(intent, 1), flags)
+                    ramp = Image.frombytes("L", (256, 1), bytes(range(256)))
+                    out = np.asarray(ImageCms.applyTransform(ramp, t), np.float32).reshape(256, 3)
+                    self._gray_lut = out / 255.0
+                    self.source_desc = "embedded: " + (profile_info(embedded)[1] or "gray profile")
+                except Exception as e:
+                    self.source_desc = f"gray profile error ({e})"
+            if self._gray_lut is None and not self.source_desc.startswith("gray profile error"):
+                self.source_desc = "untagged gray (copied as-is)"
             return
         prof_bytes = None
         if embedded and use_embedded:
@@ -321,7 +342,11 @@ class ColorConverter:
             return np.zeros((h, w, 3), np.float32)
         if self.method == "gray":
             g = chans[0].astype(np.float32) / self.max
-            return np.repeat(g[:, :, None], 3, axis=2)
+            if self._gray_lut is None:
+                return np.repeat(g[:, :, None], 3, axis=2)
+            xs = np.linspace(0, 1, 256, dtype=np.float32)
+            return np.stack([np.interp(g, xs, self._gray_lut[:, c]).astype(np.float32)
+                             for c in range(3)], axis=-1)
         if self.method == "identity":
             return np.stack(chans[:3], axis=-1).astype(np.float32) / self.max
         if self.method == "naive":
@@ -471,7 +496,8 @@ class Compositor:
         return out
 
     def _layer_rgba(self, L: Layer):
-        """-> (dst slices, rgb, alpha) on the canvas, or None."""
+        """-> (dst slices, rgb, shape alpha) on the canvas, or None.
+        Shape = transparency x layer mask (no opacity, no fill)."""
         p = self._place(L.top, L.left, L.bottom, L.right)
         if p is None:
             return None
@@ -486,7 +512,6 @@ class Compositor:
         mc = self._mask_canvas(L)
         if mc is not None:
             a = a * mc[dst]
-        a = a * (L.opacity / 255.0)
         return dst, rgb, a
 
     @staticmethod
@@ -507,58 +532,89 @@ class Compositor:
     def _visible(self, L: Layer) -> bool:
         return L.visible and id(L) not in self.hidden
 
-    def _composite_nodes(self, nodes, rgb, alpha):
-        base_alpha = None   # canvas alpha of the current clipping base
-        base_visible = True
-        for n in nodes:
-            L = n.layer
-            if not L.clipping:
-                base_alpha, base_visible = None, self._visible(L)
-            elif not base_visible:
-                continue
-            if not self._visible(L):
-                continue
-            mode = L.blend()
-            if mode not in BLENDS:
-                self.unsupported.add(BLEND_NAMES.get(mode, mode))
-            if n.is_group:
-                op = L.opacity / 255.0
-                mc = self._mask_canvas(L)
-                if mode == "pass":
-                    work_rgb, work_a = rgb.copy(), alpha.copy()
-                    self._composite_nodes(n.children, work_rgb, work_a)
-                    f = np.float32(op) if mc is None else (op * mc)
-                    if np.ndim(f) == 0 and f == 1:
-                        rgb[:], alpha[:] = work_rgb, work_a
-                    else:
-                        f2 = f if np.ndim(f) else np.full(alpha.shape, f, np.float32)
-                        rgb[:] = rgb + (work_rgb - rgb) * f2[..., None]
-                        alpha[:] = alpha + (work_a - alpha) * f2
+    def _mode(self, L: Layer) -> str:
+        mode = L.blend()
+        if mode not in BLENDS:
+            self.unsupported.add(BLEND_NAMES.get(mode, mode))
+        return mode
+
+    def _draw_node(self, n, rgb, alpha, clip=None):
+        """Draw one layer/group with its own blend, opacity, fill and mask.
+        clip: optional canvas alpha of a clipping base (clipped layers)."""
+        L = n.layer
+        mode = self._mode(L)
+        op = L.opacity / 255.0
+        if n.is_group:
+            mc = self._mask_canvas(L)
+            if mode == "pass" and clip is None:
+                work_rgb, work_a = rgb.copy(), alpha.copy()
+                self._composite_nodes(n.children, work_rgb, work_a)
+                f = None if mc is None else op * mc
+                if f is None and op == 1:
+                    rgb[:], alpha[:] = work_rgb, work_a
                 else:
-                    g_rgb = np.zeros_like(rgb)
-                    g_a = np.zeros_like(alpha)
-                    self._composite_nodes(n.children, g_rgb, g_a)
-                    g_a *= op
-                    if mc is not None:
-                        g_a *= mc
-                    rgb[:], alpha[:] = self._blend_into(rgb, alpha, g_rgb, g_a, mode)
-                if not L.clipping:
-                    base_alpha = None  # clipping to groups: not supported
-                continue
+                    f2 = f if f is not None else np.full(alpha.shape, op, np.float32)
+                    rgb[:] = rgb + (work_rgb - rgb) * f2[..., None]
+                    alpha[:] = alpha + (work_a - alpha) * f2
+                return
+            g_rgb, g_a = np.zeros_like(rgb), np.zeros_like(alpha)
+            self._composite_nodes(n.children, g_rgb, g_a)
+            g_a *= op
+            if mc is not None:
+                g_a *= mc
+            if clip is not None:
+                g_a *= clip
+            rgb[:], alpha[:] = self._blend_into(rgb, alpha, g_rgb, g_a, "norm" if mode == "pass" else mode)
+            return
+        r = self._layer_rgba(L)
+        if r is None:
+            return
+        dst, cs, shape = r
+        as_ = shape * (op * L.fill_opacity / 255.0)
+        if clip is not None:
+            as_ = as_ * clip[dst]
+        rgb[dst], alpha[dst] = self._blend_into(rgb[dst], alpha[dst], cs, as_, mode)
+
+    def _draw_clipping_group(self, base, clipped, rgb, alpha):
+        """Photoshop clipping: the clipped layers are drawn inside the base's
+        shape, then the whole unit takes the base's opacity and blend mode."""
+        L = base.layer
+        u_rgb, u_a = np.zeros_like(rgb), np.zeros_like(alpha)
+        if base.is_group:
+            mc = self._mask_canvas(L)
+            self._composite_nodes(base.children, u_rgb, u_a)
+            if mc is not None:
+                u_a *= mc
+            clip = u_a.copy()
+        else:
             r = self._layer_rgba(L)
-            if r is None:
-                if not L.clipping:
-                    base_alpha = np.zeros_like(alpha)
-                continue
-            dst, cs, as_ = r
-            if L.clipping:
-                if base_alpha is not None:
-                    as_ = as_ * base_alpha[dst]
+            clip = np.zeros_like(alpha)
+            if r is not None:
+                dst, cs, shape = r
+                clip[dst] = shape
+                u_rgb[dst], u_a[dst] = self._blend_into(u_rgb[dst], u_a[dst], cs,
+                                                        shape * (L.fill_opacity / 255.0), "norm")
+        for c in clipped:
+            self._draw_node(c, u_rgb, u_a, clip=clip)
+        mode = self._mode(L)
+        rgb[:], alpha[:] = self._blend_into(rgb, alpha, u_rgb, u_a * (L.opacity / 255.0),
+                                            "norm" if mode == "pass" else mode)
+
+    def _composite_nodes(self, nodes, rgb, alpha):
+        i = 0
+        while i < len(nodes):
+            base = nodes[i]
+            j = i + 1
+            while j < len(nodes) and nodes[j].layer.clipping:
+                j += 1
+            clipped = [n for n in nodes[i + 1:j] if self._visible(n.layer)]
+            i = j
+            if not self._visible(base.layer):
+                continue                      # hidden base hides its clipped layers
+            if clipped:
+                self._draw_clipping_group(base, clipped, rgb, alpha)
             else:
-                base_alpha = np.zeros_like(alpha)
-                base_alpha[dst] = as_ / max(L.opacity / 255.0, 1e-6) if L.opacity else 0
-                base_alpha = np.clip(base_alpha, 0, 1)
-            rgb[dst], alpha[dst] = self._blend_into(rgb[dst], alpha[dst], cs, as_, mode)
+                self._draw_node(base, rgb, alpha)
 
     def run(self):
         rgb = np.zeros((self.H, self.W, 3), np.float32)

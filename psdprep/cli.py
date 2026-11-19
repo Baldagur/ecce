@@ -19,6 +19,10 @@ def _wants_gui(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "install-shortcut":
+        from .desktop import install
+        install()
+        return 0
     if argv and argv[0] == "selftest":
         from .selftest import run
         log = argv[argv.index("--log") + 1] if "--log" in argv[:-1] else None
@@ -53,6 +57,8 @@ def main(argv=None):
     ap.add_argument("--artboards", action="store_true",
                     help="with --auto: export each artboard on its own, numbered in reading order")
     ap.add_argument("--layer-order", action="store_true", help="number artboards in layers-panel order")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="allow replacing existing --out-psd/--out-flat files (never the input)")
     ap.add_argument("--version", action="version", version=__version__)
     a = ap.parse_args(argv)
 
@@ -78,7 +84,16 @@ def main(argv=None):
                  bpc=not a.no_bpc, flatten_source=a.source, out_psd=a.out_psd,
                  out_flat=a.out_flat, flat_depth=a.depth, flat_alpha=not a.no_alpha)
     if a.crop:
-        s.crop = tuple(int(v) for v in a.crop.split(","))
+        try:
+            x, y, w, h = (int(v) for v in a.crop.split(","))
+        except ValueError:
+            ap.error("--crop needs four whole numbers: x,y,w,h")
+        if w <= 0 or h <= 0:
+            ap.error("--crop width and height must be positive")
+        if x >= doc.width or y >= doc.height or x + w <= 0 or y + h <= 0:
+            ap.error(f"--crop {a.crop} is outside the {doc.width}x{doc.height} image")
+        s.crop = (x, y, w, h)
+    s.overwrite = a.overwrite
     if s.cmyk_profile is None:
         found = ops.find_cmyk_profiles()
         if found:
@@ -100,5 +115,8 @@ def main(argv=None):
             return 0
         s.out_psd = stem + ".psd" if want_psd else None
         s.out_flat = stem + ext if want_flat else None
-    process(doc, s)
+    try:
+        process(doc, s)
+    except FileExistsError as e:
+        ap.error(f"{e}. Use --overwrite to replace it, or --auto for versioned names.")
     return 0
