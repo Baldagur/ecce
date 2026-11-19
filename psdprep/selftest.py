@@ -75,14 +75,20 @@ def _gui(tmp):
     from .fixtures import make_doc
     from .psdfile import write_psd, read_psd
     from . import gui
-    from .pipeline import process
+    from .pipeline import process  # noqa: F401
 
     src = os.path.join(tmp, "gui_in.psd")
     write_psd(make_doc(8), src)
     app = gui.QtWidgets.QApplication.instance() or gui.QtWidgets.QApplication([])
     w = gui.MainWindow()
     w.show()
-    w._loaded(src, read_psd(src))                  # synchronous load (no thread)
+    import time
+    w.open(src)                                    # same path as drag & drop (worker thread)
+    t0 = time.time()
+    while (w.doc is None or w.thread is not None) and time.time() - t0 < 30:
+        app.processEvents()
+        time.sleep(0.01)
+    assert w.doc is not None, "file did not load"
     app.processEvents()
     assert len(w.items) == 6, f"tree has {len(w.items)} items"
     assert w.view.pix.pixmap().width() > 0, "empty preview"
@@ -102,7 +108,11 @@ def _gui(tmp):
     s = w._settings()
     s.out_psd = os.path.join(tmp, "gui_out.psd")
     s.out_flat = os.path.join(tmp, "gui_out.png")
-    process(w.doc, s, log=lambda *a: None)
+    w._run(process, w.doc, s)                      # export through the worker thread too
+    t0 = time.time()
+    while w.thread is not None and time.time() - t0 < 60:
+        app.processEvents()
+        time.sleep(0.01)
     o = read_psd(s.out_psd)
     assert (o.width, o.height) == (w.view.crop[2], w.view.crop[3])
     w.close()

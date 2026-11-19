@@ -813,7 +813,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self._progress)
-        self.worker.done.connect(lambda r: self._finish(r, on_done))
+        self._on_done = on_done
+        # bound methods of this window -> queued to the GUI thread (a lambda
+        # would run in the worker thread and crash Qt)
+        self.worker.done.connect(self._finish)
         self.worker.failed.connect(self._failed)
         self.thread.start()
 
@@ -824,11 +827,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _cleanup(self):
         self.thread.quit()
         self.thread.wait()
+        self.worker.deleteLater()
+        self.thread.deleteLater()
         self.thread = None
         self.progress.setVisible(False)
         self.setEnabled(True)
 
-    def _finish(self, res, on_done):
+    def _finish(self, res):
+        on_done, self._on_done = self._on_done, None
         self._cleanup()
         if on_done:
             try:
@@ -848,8 +854,42 @@ class MainWindow(QtWidgets.QMainWindow):
         box.exec() if hasattr(box, "exec") else box.exec_()
 
 
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".psdprep.log")
+
+
+def _install_crash_handlers():
+    """Python errors -> dialog + log file instead of a silent exit;
+    hard crashes -> native traceback in ~/.psdprep.log."""
+    try:
+        import faulthandler
+        _install_crash_handlers.f = open(LOG_PATH, "a", buffering=1)
+        faulthandler.enable(_install_crash_handlers.f)
+    except Exception:
+        pass
+
+    def hook(et, ev, tb):
+        msg = "".join(traceback.format_exception(et, ev, tb))
+        try:
+            with open(LOG_PATH, "a") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+        sys.__stderr__.write(msg)
+        try:
+            box = QtWidgets.QMessageBox()
+            box.setWindowTitle("PSD Prep error")
+            box.setText(f"{et.__name__}: {ev}")
+            box.setInformativeText(f"Details saved to {LOG_PATH}")
+            box.setDetailedText(msg)
+            box.exec() if hasattr(box, "exec") else box.exec_()
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
+    _install_crash_handlers()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(argv)
     app.setApplicationName("PSD Prep")
     app.setStyle("Fusion")
