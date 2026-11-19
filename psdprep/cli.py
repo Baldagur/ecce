@@ -17,6 +17,10 @@ def _wants_gui(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "selftest":
+        from .selftest import run
+        log = argv[argv.index("--log") + 1] if "--log" in argv[:-1] else None
+        return run(log)
     if _wants_gui(argv):
         from .gui import main as gui_main
         return gui_main([sys.argv[0]] + argv)

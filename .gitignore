@@ -4,3 +4,6 @@ build/
 dist/
 *.spec
 wheels/
+build-venv/
+.venv/
+psdprep/_build_stamp.py

@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover
     QT6 = False
 
 from . import ops, __version__
+from .version import BUILD
 from .pipeline import Settings, process, use_saved_composite, make_converter
 from .psdfile import MODE_CMYK, MODE_NAMES, MODE_RGB, read_psd
 
@@ -260,7 +261,7 @@ KIND_LABEL = {"text": "Text → raster", "smart": "Smart obj → raster",
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"PSD Prep {__version__}")
+        self.setWindowTitle(f"PSD Prep {__version__} ({BUILD})")
         self.resize(1500, 900)
         self.setAcceptDrops(True)
         self.settings = QtCore.QSettings("psdprep", "psdprep")
@@ -508,7 +509,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rgb_cache = {}
         longest = max(doc.width, doc.height)
         self.scale = max(1, math.ceil(longest / PREVIEW_MAX))
-        self.setWindowTitle(f"PSD Prep {__version__} — {os.path.basename(path)}")
+        self.setWindowTitle(f"PSD Prep {__version__} ({BUILD}) — {os.path.basename(path)}")
         for sp in self.spins:
             sp.blockSignals(True)
             sp.setMaximum(max(doc.width, doc.height))

@@ -7,8 +7,8 @@ without internet access.
 ## Use
 
 ```
-./psdprep                 # GUI (or double-click)
-./psdprep file.psd        # GUI with a file open (drag & drop works too)
+PSDPrep/PSDPrep                 # GUI (or double-click)
+PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
 ```
 
 * **Layers panel**: untick a layer to remove it. Removing a group removes everything in it.
@@ -38,10 +38,10 @@ without internet access.
 ### Command line (same engine)
 
 ```
-psdprep in.psd --list
-psdprep in.psd --remove "Retouch*" --remove-hidden --crop 0,0,1920,1080 \
+PSDPrep in.psd --list
+PSDPrep in.psd --remove "Retouch*" --remove-hidden --crop 0,0,1920,1080 \
         --out-psd out.psd --out-flat out.png --depth 16
-psdprep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
+PSDPrep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
 ```
 
 ## Limits (v0.1)
@@ -54,26 +54,36 @@ psdprep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
 * 16-bit CMYK is converted through a 4D LUT sampled from littleCMS (18 nodes per channel).
   Against the exact 8-bit path the difference is ≤ ~1.5/255.
 
-## Build the double-click app (offline Rocky)
+## Standalone app (double-click, nothing to install)
 
-On any machine with internet, download the wheels for the Rocky Python version:
+The app is built once on a machine with internet. That gives you a folder with Python, Qt,
+numpy and Pillow inside, so the Rocky machine needs no Python, no pip and no internet. It works
+the same way as the slater.
+
+**GitHub Actions (easiest).** Every push to `main` builds the app inside a Rocky 8 container and
+self-tests it headless. The download lands on one fixed page:
+**Releases → latest → `PSDPrep-linux-x86_64.tar.gz`**
+(you can also go to *Actions → Build PSD Prep → Run workflow* to run it by hand).
+
+Copy the file to the Rocky machine, then:
 
 ```
-pip download -d wheels --only-binary=:all: --platform manylinux_2_28_x86_64 \
-    --python-version 3.11 numpy Pillow PySide6-Essentials pyinstaller
+tar -xzf PSDPrep-linux-x86_64.tar.gz
+PSDPrep/PSDPrep            # or double-click "PSD Prep.desktop" (first time: right-click > Allow Launching)
 ```
 
-Copy the repo and the `wheels/` folder to Rocky, then:
+Builds run on Rocky 8 and 9. The window title shows the build date and commit.
 
-```
-python3.11 -m pip install --user --no-index --find-links wheels numpy Pillow PySide6-Essentials pyinstaller
-PYTHON=python3.11 ./build.sh        # -> dist/psdprep
-```
+**Docker** on any computer with internet: `./build_docker.sh` writes the same
+`dist/PSDPrep-linux-x86_64.tar.gz`.
 
-Put any CMYK `.icc` profiles in `profiles/` before building and they get bundled. The app also
-finds system profiles (e.g. Ghostscript's `/usr/share/ghostscript/*/iccprofiles`).
+**CMYK profiles:** files with an embedded profile always use their own. For untagged CMYK files,
+the build includes Ghostscript's generic `default_cmyk.icc`. To ship your own profiles (Coated
+FOGRA39, SWOP…), drop the `.icc` files into `profiles/` before building, or later into
+`PSDPrep/profiles/` next to the app. You can also pick one with the **…** button.
 
-Run from source: `python3 main.py`. Tests: `python3 tests/test_roundtrip.py`.
+From source (on a machine that has the libraries): `python3 app_main.py`. Tests:
+`python3 tests/test_roundtrip.py`. Self-test: `PSDPrep selftest`.
 
 ## Layout
 
@@ -84,4 +94,6 @@ psdprep/imgio.py     PNG / TIFF writers (8/16-bit, alpha, ICC)
 psdprep/pipeline.py  settings -> outputs
 psdprep/gui.py       PySide6 UI (falls back to PySide2)
 psdprep/cli.py       command line / entry point
+psdprep/selftest.py  headless self-test (run by CI on the built app)
+build.py, ci/, .github/workflows/build.yml   standalone build (Rocky 8 container)
 ```

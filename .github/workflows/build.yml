@@ -1,0 +1,54 @@
+# Builds PSD Prep for Rocky Linux on GitHub's servers.
+# Actions tab > "Build PSD Prep" > Run workflow (also runs on every push to main),
+# then grab PSDPrep-linux-x86_64.tar.gz from the "latest" release.
+name: Build PSD Prep
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write          # lets the release job publish the "latest" download
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: rockylinux:8          # oldest glibc -> runs on Rocky 8 and 9
+    steps:
+      - name: Install git/curl for checkout
+        run: dnf install -y git curl-minimal || dnf install -y git curl
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: bash ci/build_linux.sh
+      - name: Self-test the built app (headless)
+        env: { QT_QPA_PLATFORM: offscreen }
+        run: dist/PSDPrep/PSDPrep selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PSDPrep-linux-x86_64
+          path: dist/PSDPrep-linux-x86_64.tar.gz
+
+  release:
+    # One fixed page that always has the newest download:
+    # https://github.com/<owner>/<repo>/releases/tag/latest
+    needs: [linux]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Publish to the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          STAMP="$(date -u +%Y-%m-%d) · ${GITHUB_SHA::7}"
+          gh release delete latest --repo "$REPO" --cleanup-tag --yes || true
+          gh release create latest --repo "$REPO" --target "$GITHUB_SHA" --prerelease \
+            --title "PSD Prep (latest build)" \
+            --notes "Built $STAMP from the newest commit. The window title shows the same build stamp.
+
+          Linux (Rocky 8/9): PSDPrep-linux-x86_64.tar.gz -> tar -xzf it, then run PSDPrep (or double-click 'PSD Prep.desktop')." \
+            artifacts/PSDPrep-linux-x86_64/PSDPrep-linux-x86_64.tar.gz
