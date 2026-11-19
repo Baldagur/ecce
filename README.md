@@ -20,7 +20,21 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   it uses the profile chosen in the *CMYK profile* menu. Intent and BPC default to Photoshop's
   defaults (Relative Colorimetric + black point compensation). The output PSD gets an sRGB
   profile embedded.
-* **Save PSD…** / **Export flattened…** / **Save both…**. The original file is never overwritten.
+* **Original panel** shows the source's colour mode (RGB / CMYK / Gray / Lab), bit depth,
+  embedded colour profile and its colour space.
+* **The original is protected.** Every write is checked against the source file (resolved
+  paths and hard links included) and refused if it matches, from the GUI and the command line.
+* **Save to → Next to the original, auto-named** (the default) writes into the source folder
+  as `<name>_<suffix>_v1.psd` / `.png`, then `_v2`, `_v3`… The suffix defaults to `cleanup` and
+  you can edit it. The version is one more than the highest found in that folder, so nothing is
+  ever overwritten. The panel shows the next name. *Ask where to save* uses file dialogs instead.
+* **Artboards** (Photoshop's "pages") are listed when the file has them. Tick the ones to export,
+  drag to reorder, or use *Reading order* (rows top to bottom, left to right) or *Layers order*.
+  *Export artboards* writes each one as its own PSD and/or flattened file, numbered in that
+  order: `<name>_cleanup_v1_01_<Artboard>.psd`, `_02_…`. Each one is cropped to its artboard,
+  keeps only its own layers, and gets the artboard background colour. In the PSD that colour is
+  a bottom layer; tick *Transparent background* to skip it. Clicking an artboard outlines it in
+  the preview.
   Flattened files are always sRGB, have straight (unpremultiplied) alpha and an embedded sRGB
   profile, at 8 or 16 bits.
 
@@ -42,6 +56,8 @@ PSDPrep in.psd --list
 PSDPrep in.psd --remove "Retouch*" --remove-hidden --crop 0,0,1920,1080 \
         --out-psd out.psd --out-flat out.png --depth 16
 PSDPrep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
+PSDPrep in.psd --auto both                     # -> in_cleanup_v1.psd + .png next to in.psd
+PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>.png, _02_…
 ```
 
 ## Limits (v0.1)
@@ -94,6 +110,9 @@ psdprep/imgio.py     PNG / TIFF writers (8/16-bit, alpha, ICC)
 psdprep/pipeline.py  settings -> outputs
 psdprep/gui.py       PySide6 UI (falls back to PySide2)
 psdprep/cli.py       command line / entry point
+psdprep/artboards.py artboard detection / ordering
+psdprep/naming.py    auto names, versions, original-file guard
+psdprep/descriptor.py Photoshop descriptor parser
 psdprep/selftest.py  headless self-test (run by CI on the built app)
 build.py, ci/, .github/workflows/build.yml   standalone build (Rocky 8 container)
 ```

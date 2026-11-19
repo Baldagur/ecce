@@ -35,3 +35,33 @@ def make_doc(depth: int = 8, icc: bytes = None) -> PSD:
     off = L("Off canvas", 150, 275, 250, 375, (0, 0, 0, 1), np.full((100, 100), mx // 2, dt))
     d.layers = [bg, Layer(name="</Layer group>", section=SECTION_DIVIDER), c1, m, grp, hid, off]
     return d
+
+
+def make_artboard_doc() -> PSD:
+    """RGB doc with three artboards. Layers panel order (top first):
+    Banner, Small, Square. Reading order: Square, Banner, Small."""
+    from . import descriptor
+    from .psdfile import MODE_RGB
+    W, H = 700, 300
+    d = PSD(width=W, height=H, depth=8, mode=MODE_RGB, num_channels=3)
+
+    def board(name, x, y, w, h, bg_type, color, clr=None):
+        info = {"artboardRect": {"Top ": float(y), "Left": float(x), "Btom": float(y + h),
+                                 "Rght": float(x + w)},
+                "artboardBackgroundType": bg_type}
+        if clr:
+            info["Clr "] = {"Rd  ": float(clr[0]), "Grn ": float(clr[1]), "Bl  ": float(clr[2])}
+        g = Layer(name=name, section=SECTION_OPEN, section_blend="pass",
+                  tagged=[(b"8BIM", b"artb", descriptor.build(info))])
+        # content: a box in the middle of the artboard, half covering it
+        cw, ch = w // 2, h // 2
+        px = {i: np.full((ch, cw), color[i], np.uint8) for i in range(3)}
+        px[-1] = np.full((ch, cw), 255, np.uint8)
+        content = Layer(name=f"{name} box", top=y + h // 4, left=x + w // 4,
+                        bottom=y + h // 4 + ch, right=x + w // 4 + cw, channels=px)
+        return [Layer(name="</Layer group>", section=SECTION_DIVIDER), content, g]
+
+    d.layers = (board("Square", 0, 0, 300, 300, 1, (200, 30, 30))
+                + board("Small", 350, 150, 200, 150, 4, (30, 30, 200), clr=(255, 0, 0))
+                + board("Banner", 350, 0, 350, 100, 3, (30, 200, 30)))
+    return d

@@ -8,6 +8,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import ops
+from .artboards import Artboard, others_to_remove
+from .naming import artboard_stem, guard
 from .imgio import write_png, write_tiff
 from .psdfile import MODE_RGB, PSD, write_psd
 
@@ -28,6 +30,9 @@ class Settings:
     out_flat: Optional[str] = None                    # .png / .tif / .tiff
     flat_depth: Optional[int] = None                  # 8 / 16 / None = same as PSD
     flat_alpha: bool = True
+    source_path: Optional[str] = None                 # original file: never written to
+    artboard: Optional[Artboard] = None               # export just this artboard
+    artboard_transparent: bool = False                # ignore the artboard's background colour
 
 
 def make_converter(doc: PSD, s: Settings) -> ops.ColorConverter:
@@ -41,16 +46,25 @@ def edited_doc(doc: PSD, s: Settings) -> PSD:
     for i, vis in s.visibility.items():
         if 0 <= i < len(work.layers):
             work.layers[i].visible = vis
-    if s.remove:
-        ids = {id(work.layers[i]) for i in s.remove if 0 <= i < len(work.layers)}
+    remove = set(s.remove)
+    crop = s.crop
+    if s.artboard is not None:
+        remove |= others_to_remove(doc, s.artboard)
+        crop = s.artboard.rect
+    if remove:
+        ids = {id(work.layers[i]) for i in remove if 0 <= i < len(work.layers)}
         ops.remove_layers(work, ids)
-    if s.crop:
-        ops.crop(work, *s.crop, delete_pixels=s.delete_cropped)
+    if crop:
+        ops.crop(work, *crop, delete_pixels=s.delete_cropped)
+        # artboard rectangles no longer match the cropped canvas: plain groups
+        from .artboards import ARTBOARD_KEYS
+        for L in work.layers:
+            L.tagged = [t for t in L.tagged if t[1] not in ARTBOARD_KEYS]
     return work
 
 
 def use_saved_composite(doc: PSD, s: Settings) -> bool:
-    if s.flatten_source == "layers":
+    if s.flatten_source == "layers" or (s.artboard is not None and s.flatten_source == "auto"):
         return False
     usable = ops.merged_is_usable(doc)
     if s.flatten_source == "composite":
@@ -62,6 +76,7 @@ def use_saved_composite(doc: PSD, s: Settings) -> bool:
 
 def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = None) -> dict:
     result = {"warnings": []}
+    guard(s.source_path, [s.out_psd, s.out_flat])
     work = edited_doc(doc, s)
     conv = make_converter(work, s)
     saved = use_saved_composite(doc, s)
@@ -90,6 +105,12 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
         adj = [L.name for L in work.layers if L.kind() == "adjustment" and L.visible]
         if adj:
             result["warnings"].append("Adjustment layers ignored: " + ", ".join(adj[:6]))
+
+    bg = None if (s.artboard is None or s.artboard_transparent) else s.artboard.background
+    if bg is not None:
+        rgb = rgb * alpha[..., None] + np.asarray(bg, np.float32) * (1 - alpha[..., None])
+        alpha = np.ones_like(alpha)
+        _add_background_layer(work, bg)
 
     if s.out_psd:
         ops.prepare_for_save(work)
@@ -126,3 +147,49 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
     for w in result["warnings"]:
         log("Note: " + w)
     return result
+
+
+def _add_background_layer(doc: PSD, rgb: tuple):
+    """Artboard background colour as a solid bottom layer (artboards keep it
+    outside the layers, so a stand-alone PSD would otherwise lose it)."""
+    from .psdfile import Layer, MODE_CMYK, MODE_GRAY
+    r, g, b = rgb
+    if doc.mode == MODE_RGB:
+        vals = [r, g, b]
+    elif doc.mode == MODE_CMYK:
+        k = 1 - max(r, g, b)
+        c, m, y = ((1 - v - k) / (1 - k) if k < 1 else 0 for v in (r, g, b))
+        vals = [1 - c, 1 - m, 1 - y, 1 - k]       # PSD stores CMYK inverted
+    elif doc.mode == MODE_GRAY:
+        vals = [0.2126 * r + 0.7152 * g + 0.0722 * b]
+    else:
+        return
+    ch = {i: np.full((doc.height, doc.width), round(v * doc.max_value), doc.dtype)
+          for i, v in enumerate(vals)}
+    doc.layers.insert(0, Layer(name="Artboard background", top=0, left=0, bottom=doc.height,
+                               right=doc.width, channels=ch))
+
+
+def export_artboards(doc: PSD, base: Settings, boards: list, stem: str, want_psd: bool,
+                     flat_ext: Optional[str], log: Callable = print, progress: Callable = None) -> dict:
+    """Export each artboard on its own, numbered in the given order:
+    <stem>_01_<name>.psd / .png ..."""
+    import copy
+    width = max(2, len(str(len(boards))))
+    written = []
+    for n, board in enumerate(boards, 1):
+        s = copy.copy(base)
+        s.artboard = board
+        s.crop = None
+        st = artboard_stem(stem, n, board.name, width)
+        s.out_psd = st + ".psd" if want_psd else None
+        s.out_flat = st + flat_ext if flat_ext else None
+        for p in (s.out_psd, s.out_flat):
+            if p and os.path.exists(p):
+                raise FileExistsError(f"{p} already exists")
+        log(f"[{n}/{len(boards)}] {board.name}")
+        process(doc, s, log=log)
+        written += [p for p in (s.out_psd, s.out_flat) if p]
+        if progress:
+            progress(n, len(boards))
+    return {"written": written, "warnings": [], "composite_source": "artboards"}

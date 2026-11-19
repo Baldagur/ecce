@@ -43,7 +43,8 @@ ADJUST_KEYS = {b"levl", b"curv", b"brit", b"blnc", b"hue2", b"hue ", b"selc",
                b"expA", b"clrL", b"blwh", b"CgEd"}
 FILL_KEYS = {b"SoCo", b"GdFl", b"PtFl"}
 # Tagged blocks we copy into the output as-is (safe after edits).
-_KEEP_KEYS = {b"lyid", b"clbl", b"infx", b"knko", b"lspf", b"lclr", b"fxrp"}
+_KEEP_KEYS = {b"lyid", b"clbl", b"infx", b"knko", b"lspf", b"lclr", b"fxrp",
+              b"artb", b"artd", b"abdd"}  # artboards (dropped by the pipeline after a crop)
 
 
 class PSDError(Exception):

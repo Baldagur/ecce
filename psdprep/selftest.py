@@ -105,19 +105,51 @@ def _gui(tmp):
     w.chk_convert.setChecked(True)
     w.refresh_preview()
     app.processEvents()
-    s = w._settings()
-    s.out_psd = os.path.join(tmp, "gui_out.psd")
-    s.out_flat = os.path.join(tmp, "gui_out.png")
-    w._run(process, w.doc, s)                      # export through the worker thread too
-    t0 = time.time()
-    while w.thread is not None and time.time() - t0 < 60:
+    def wait(limit=60):
+        t0 = time.time()
+        while w.thread is not None and time.time() - t0 < limit:
+            app.processEvents()
+            time.sleep(0.01)
         app.processEvents()
-        time.sleep(0.01)
-    o = read_psd(s.out_psd)
+
+    before = open(src, "rb").read()
+    # auto-named save next to the original: v1, then v2
+    w.rad_auto.setChecked(True)
+    w.txt_suffix.setText("cleanup")
+    w.cmb_fmt.setCurrentText("PNG")
+    w.export(psd=True, flat=True)
+    wait()
+    w.export(psd=True, flat=False)
+    wait()
+    made = sorted(f for f in os.listdir(tmp) if f.startswith("gui_in_cleanup"))
+    assert made == ["gui_in_cleanup_v1.png", "gui_in_cleanup_v1.psd", "gui_in_cleanup_v2.psd"], made
+    o = read_psd(os.path.join(tmp, "gui_in_cleanup_v1.psd"))
     assert (o.width, o.height) == (w.view.crop[2], w.view.crop[3])
+    assert "v3" in w.lbl_next.text(), w.lbl_next.text()
+    assert open(src, "rb").read() == before, "original changed"
+    assert w.orig["mode"].text().find("CMYK") >= 0
+
+    # artboards: list, reorder, export each one
+    from .fixtures import make_artboard_doc
+    bsrc = os.path.join(tmp, "boards.psd")
+    write_psd(make_artboard_doc(), bsrc)
+    w.open(bsrc)
+    wait()
+    assert w.grp_boards.isVisibleTo(w) and w.lst_boards.count() == 3
+    w._order_boards("position")
+    names = [w.lst_boards.item(i).text().split("  ")[0] for i in range(3)]
+    assert names == ["Square", "Banner", "Small"], names
+    w.lst_boards.setCurrentRow(1)
+    assert w.view.hl.isVisible()
+    w.lst_boards.item(2).setCheckState(gui.UNCHECKED)       # skip "Small"
+    w.export_boards()
+    wait()
+    made = sorted(f for f in os.listdir(tmp) if f.startswith("boards_cleanup"))
+    assert made == ["boards_cleanup_v1_01_Square.png", "boards_cleanup_v1_01_Square.psd",
+                    "boards_cleanup_v1_02_Banner.png", "boards_cleanup_v1_02_Banner.psd"], made
     w.close()
     app.processEvents()
-    return f"window ok, exported {o.width}x{o.height}"
+    return f"window ok; auto-named v1/v2; {len(made)} artboard files"
 
 
 def run(log_path=None) -> int:

@@ -7,7 +7,9 @@ import os
 import sys
 
 from . import __version__, ops
-from .pipeline import Settings, process
+from . import naming
+from .artboards import find_artboards, is_artboard, sort_by_position
+from .pipeline import Settings, export_artboards, process
 from .psdfile import MODE_NAMES, read_psd
 
 
@@ -44,16 +46,23 @@ def main(argv=None):
     ap.add_argument("--depth", type=int, choices=[8, 16], help="bit depth of the flattened file")
     ap.add_argument("--no-alpha", action="store_true", help="flattened file without alpha")
     ap.add_argument("--source", default="auto", choices=["auto", "layers", "composite"])
+    ap.add_argument("--auto", choices=["psd", "flat", "both"],
+                    help="save next to the original as <name>_<suffix>_v<N> (never overwrites)")
+    ap.add_argument("--suffix", default="cleanup", help="name suffix for --auto (default: cleanup)")
+    ap.add_argument("--format", default="png", choices=["png", "tif"], help="flattened format for --auto")
+    ap.add_argument("--artboards", action="store_true",
+                    help="with --auto: export each artboard on its own, numbered in reading order")
+    ap.add_argument("--layer-order", action="store_true", help="number artboards in layers-panel order")
     ap.add_argument("--version", action="version", version=__version__)
     a = ap.parse_args(argv)
 
     doc = read_psd(a.psd)
-    if a.list or not (a.out_psd or a.out_flat):
+    if a.list or not (a.out_psd or a.out_flat or a.auto):
         print(f"{a.psd}: {doc.width}x{doc.height} {MODE_NAMES.get(doc.mode)} {doc.depth}-bit, "
               f"profile: {ops.profile_info(doc.icc_profile)[1] if doc.icc_profile else 'none'}")
         for node, depth in ops.walk(ops.build_tree(doc.layers)):
             L = node.layer
-            flags = [L.kind()] + (["hidden"] if not L.visible else []) + \
+            flags = [L.kind() if not is_artboard(L) else "artboard"] + (["hidden"] if not L.visible else []) + \
                     (["fx"] if L.has_effects() else [])
             print(f"  {'  ' * depth}{L.name}  [{', '.join(flags)}]")
         return 0
@@ -74,8 +83,22 @@ def main(argv=None):
         found = ops.find_cmyk_profiles()
         if found:
             s.cmyk_profile = found[0][0]
-    for p in (a.out_psd,):
-        if p and os.path.abspath(p) == os.path.abspath(a.psd):
+    s.source_path = a.psd
+    for p in (a.out_psd, a.out_flat):
+        if p and naming.is_same_file(p, a.psd):
             ap.error("refusing to overwrite the input file")
+    ext = "." + a.format
+    if a.auto:
+        stem = naming.auto_stem(a.psd, a.suffix)
+        want_psd, want_flat = a.auto in ("psd", "both"), a.auto in ("flat", "both")
+        if a.artboards:
+            boards = find_artboards(doc)
+            if not boards:
+                ap.error("this file has no artboards")
+            boards = boards if a.layer_order else sort_by_position(boards)
+            export_artboards(doc, s, boards, stem, want_psd, ext if want_flat else None)
+            return 0
+        s.out_psd = stem + ".psd" if want_psd else None
+        s.out_flat = stem + ext if want_flat else None
     process(doc, s)
     return 0

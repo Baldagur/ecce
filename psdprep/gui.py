@@ -17,9 +17,9 @@ except ImportError:  # pragma: no cover
     from PySide2.QtCore import Signal
     QT6 = False
 
-from . import ops, __version__
+from . import artboards as ab_mod, naming, ops, __version__
 from .version import BUILD
-from .pipeline import Settings, process, use_saved_composite, make_converter
+from .pipeline import Settings, export_artboards, make_converter, process, use_saved_composite
 from .psdfile import MODE_CMYK, MODE_NAMES, MODE_RGB, read_psd
 
 Qt = QtCore.Qt
@@ -97,6 +97,15 @@ class PreviewView(QtWidgets.QGraphicsView):
         self.frame.setPen(pen)
         self.frame.setZValue(6)
         self.scene().addItem(self.frame)
+        self.hl = QtWidgets.QGraphicsRectItem()
+        hpen = QtGui.QPen(QtGui.QColor(60, 200, 255))
+        hpen.setCosmetic(True)
+        hpen.setWidth(2)
+        hpen.setStyle(E(Qt, "PenStyle", "DashLine"))
+        self.hl.setPen(hpen)
+        self.hl.setZValue(7)
+        self.hl.setVisible(False)
+        self.scene().addItem(self.hl)
         self.doc_w = self.doc_h = 0
         self.crop = None
         self.aspect = None
@@ -114,6 +123,14 @@ class PreviewView(QtWidgets.QGraphicsView):
         if not keep_view:
             self.fit()
         self._update_overlay()
+
+    def set_highlight(self, rect):
+        """Dashed outline (artboard) without touching the crop."""
+        if rect:
+            self.hl.setRect(QtCore.QRectF(*rect))
+            self.hl.setVisible(True)
+        else:
+            self.hl.setVisible(False)
 
     def fit(self):
         if self.doc_w:
@@ -286,9 +303,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_open = tb.addAction("Open PSD…", self.open_dialog)
         self.act_open.setShortcut(QtGui.QKeySequence.StandardKey.Open if QT6 else QtGui.QKeySequence.Open)
         tb.addSeparator()
-        self.act_psd = tb.addAction("Save PSD…", lambda: self.export(psd=True, flat=False))
-        self.act_flat = tb.addAction("Export flattened…", lambda: self.export(psd=False, flat=True))
-        self.act_both = tb.addAction("Save both…", lambda: self.export(psd=True, flat=True))
+        self.act_psd = tb.addAction("Save PSD", lambda: self.export(psd=True, flat=False))
+        self.act_flat = tb.addAction("Export flattened", lambda: self.export(psd=False, flat=True))
+        self.act_both = tb.addAction("Save both", lambda: self.export(psd=True, flat=True))
         tb.addSeparator()
         tb.addAction("Fit view", lambda: self.view.fit())
 
@@ -330,14 +347,33 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(mid)
 
         # settings
+        right_outer = QtWidgets.QWidget()
+        ro = QtWidgets.QVBoxLayout(right_outer)
+        ro.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(E(QtWidgets.QFrame, "Shape", "NoFrame"))
         right = QtWidgets.QWidget()
+        scroll.setWidget(right)
+        ro.addWidget(scroll, 3)
         rv = QtWidgets.QVBoxLayout(right)
         rv.setContentsMargins(6, 6, 6, 6)
 
-        self.info = QtWidgets.QLabel("—")
+        g = QtWidgets.QGroupBox("Original (never modified)")
+        f = QtWidgets.QFormLayout(g)
+        self.orig = {}
+        for key, label in (("file", "File"), ("size", "Size"), ("mode", "Colour mode"),
+                           ("depth", "Bit depth"), ("profile", "Colour profile"),
+                           ("space", "Profile space"), ("res", "Resolution"),
+                           ("layers", "Layers"), ("boards", "Artboards")):
+            lab = QtWidgets.QLabel("—")
+            lab.setWordWrap(True)
+            lab.setTextInteractionFlags(E(Qt, "TextInteractionFlag", "TextSelectableByMouse"))
+            f.addRow(label, lab)
+            self.orig[key] = lab
+        self.info = QtWidgets.QLabel("")
         self.info.setWordWrap(True)
-        g = QtWidgets.QGroupBox("File")
-        QtWidgets.QVBoxLayout(g).addWidget(self.info)
+        f.addRow(self.info)
         rv.addWidget(g)
 
         # colour
@@ -419,15 +455,72 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow("Image from", self.cmb_source)
         rv.addWidget(g)
 
+        # where to save
+        g = QtWidgets.QGroupBox("Save to")
+        f = QtWidgets.QFormLayout(g)
+        self.rad_auto = QtWidgets.QRadioButton("Next to the original, auto-named")
+        self.rad_ask = QtWidgets.QRadioButton("Ask where to save")
+        (self.rad_ask if self.settings.value("save_mode", "auto") == "ask" else self.rad_auto).setChecked(True)
+        f.addRow(self.rad_auto)
+        f.addRow(self.rad_ask)
+        self.txt_suffix = QtWidgets.QLineEdit(self.settings.value("suffix", naming.DEFAULT_SUFFIX))
+        self.txt_suffix.setPlaceholderText("e.g. cleanup")
+        f.addRow("Name suffix", self.txt_suffix)
+        self.lbl_next = QtWidgets.QLabel("")
+        self.lbl_next.setWordWrap(True)
+        self.lbl_next.setStyleSheet("color: #999;")
+        f.addRow(self.lbl_next)
+        for w in (self.rad_auto, self.rad_ask):
+            w.toggled.connect(self._update_next_name)
+        self.txt_suffix.textChanged.connect(self._update_next_name)
+        self.cmb_fmt.currentIndexChanged.connect(self._update_next_name)
+        rv.addWidget(g)
+
+        # artboards
+        self.grp_boards = QtWidgets.QGroupBox("Artboards")
+        bv = QtWidgets.QVBoxLayout(self.grp_boards)
+        bv.addWidget(QtWidgets.QLabel("Tick to export · drag to reorder (sets the numbering)"))
+        self.lst_boards = QtWidgets.QListWidget()
+        self.lst_boards.setDragDropMode(E(QtWidgets.QAbstractItemView, "DragDropMode", "InternalMove"))
+        self.lst_boards.setMinimumHeight(110)
+        self.lst_boards.currentRowChanged.connect(self._board_selected)
+        bv.addWidget(self.lst_boards)
+        row = QtWidgets.QHBoxLayout()
+        b = QtWidgets.QPushButton("Reading order")
+        b.setToolTip("Rows top to bottom, then left to right")
+        b.clicked.connect(lambda: self._order_boards("position"))
+        row.addWidget(b)
+        b = QtWidgets.QPushButton("Layers order")
+        b.clicked.connect(lambda: self._order_boards("layers"))
+        row.addWidget(b)
+        bv.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        self.chk_board_psd = QtWidgets.QCheckBox("PSD")
+        self.chk_board_psd.setChecked(True)
+        self.chk_board_flat = QtWidgets.QCheckBox("Flattened")
+        self.chk_board_flat.setChecked(True)
+        row.addWidget(self.chk_board_psd)
+        row.addWidget(self.chk_board_flat)
+        bv.addLayout(row)
+        self.chk_board_transp = QtWidgets.QCheckBox("Transparent background (ignore artboard colour)")
+        bv.addWidget(self.chk_board_transp)
+        b = QtWidgets.QPushButton("Export artboards")
+        b.clicked.connect(self.export_boards)
+        bv.addWidget(b)
+        self.grp_boards.setVisible(False)
+        rv.addWidget(self.grp_boards)
+        rv.addStretch(1)
+
         self.progress = QtWidgets.QProgressBar()
         self.progress.setVisible(False)
-        rv.addWidget(self.progress)
+        ro.addWidget(self.progress)
         self.logbox = QtWidgets.QPlainTextEdit()
         self.logbox.setReadOnly(True)
         self.logbox.setMaximumBlockCount(500)
-        rv.addWidget(self.logbox, 1)
-        split.addWidget(right)
-        split.setSizes([330, 850, 320])
+        ro.addWidget(self.logbox, 1)
+        split.addWidget(right_outer)
+        split.setSizes([330, 820, 350])
+        self.boards = []
 
         for w in (self.chk_convert, self.chk_embedded, self.chk_bpc):
             w.toggled.connect(self._colour_changed)
@@ -520,8 +613,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_enabled(True)
         self.chk_convert.setChecked(doc.mode != MODE_RGB or bool(doc.icc_profile))
         self._colour_changed()
+        self.boards = ab_mod.find_artboards(doc)
+        self._fill_boards(self.boards)
         self.refresh_preview(fit=True)
         self._sync_spins()
+        self._update_next_name()
+
+    # -- artboards ------------------------------------------------------------
+    def _fill_boards(self, boards):
+        self.lst_boards.clear()
+        self.view.set_highlight(None)
+        for b in boards:
+            it = QtWidgets.QListWidgetItem(b.label)
+            it.setFlags(it.flags() | E(Qt, "ItemFlag", "ItemIsUserCheckable"))
+            it.setCheckState(CHECKED)
+            it.setData(E(Qt, "ItemDataRole", "UserRole"), self.boards.index(b))
+            self.lst_boards.addItem(it)
+        self.grp_boards.setVisible(bool(self.boards))
+
+    def _order_boards(self, how):
+        checked = {self.lst_boards.item(i).data(E(Qt, "ItemDataRole", "UserRole")):
+                   self.lst_boards.item(i).checkState() for i in range(self.lst_boards.count())}
+        order = ab_mod.sort_by_position(self.boards) if how == "position" else list(self.boards)
+        self._fill_boards(order)
+        for i in range(self.lst_boards.count()):
+            it = self.lst_boards.item(i)
+            it.setCheckState(checked.get(it.data(E(Qt, "ItemDataRole", "UserRole")), CHECKED))
+
+    def _board_selected(self, row):
+        if 0 <= row < self.lst_boards.count():
+            b = self.boards[self.lst_boards.item(row).data(E(Qt, "ItemDataRole", "UserRole"))]
+            self.view.set_highlight(b.rect)
+        else:
+            self.view.set_highlight(None)
+
+    def _selected_boards(self):
+        out = []
+        for i in range(self.lst_boards.count()):
+            it = self.lst_boards.item(i)
+            if it.checkState() == CHECKED:
+                out.append(self.boards[it.data(E(Qt, "ItemDataRole", "UserRole"))])
+        return out
 
     def _update_info(self):
         d = self.doc
@@ -534,16 +666,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 k = L.kind()
                 kinds[k] = kinds.get(k, 0) + 1
         fx = sum(1 for L in d.layers if L.has_effects())
-        lines = [f"<b>{os.path.basename(self.path)}</b>",
-                 f"{d.width} × {d.height}px · {MODE_NAMES.get(d.mode)} · {d.depth}-bit"
-                 + (f" · {res:g} dpi" if res else ""),
-                 f"Profile: {pdesc}",
-                 "Layers: " + ", ".join(f"{v} {k}" for k, v in kinds.items()) if kinds else "No layers"]
+        space = ops.profile_info(prof)[0] if prof else ""
+        space_name = {"RGB": "RGB", "CMYK": "CMYK", "GRAY": "Gray", "Lab": "Lab"}.get(space, space)
+        o = self.orig
+        o["file"].setText(os.path.basename(self.path))
+        o["file"].setToolTip(self.path)
+        o["size"].setText(f"{d.width} × {d.height} px")
+        o["mode"].setText(f"<b>{MODE_NAMES.get(d.mode, d.mode)}</b>")
+        o["depth"].setText(f"{d.depth}-bit")
+        o["profile"].setText(f"<b>{pdesc}</b>" if prof else
+                             "<span style='color:#e0a030'>none embedded</span>"
+                             + (" (assumed sRGB)" if d.mode == MODE_RGB else ""))
+        o["space"].setText(space_name or "—")
+        o["res"].setText(f"{res:g} dpi" if res else "—")
+        o["layers"].setText(", ".join(f"{v} {k}" for k, v in kinds.items()) if kinds else "none")
+        nb = len(ab_mod.find_artboards(d))
+        o["boards"].setText(str(nb) if nb else "none")
+        lines = []
         if fx:
             lines.append(f"<span style='color:#e0a030'>{fx} layer(s) with styles/effects</span>")
         if not ops.merged_is_usable(d):
             lines.append("<span style='color:#999'>No saved composite (Maximize compatibility off)</span>")
         self.info.setText("<br>".join(lines))
+        self.info.setVisible(bool(lines))
 
     # -- layer tree -----------------------------------------------------
     def _fill_tree(self):
@@ -761,9 +906,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.doc:
             return
         s = self._settings()
-        base = os.path.splitext(self.path)[0]
+        s.source_path = self.path
+        fmt = self.cmb_fmt.currentText()
+        ext = ".png" if fmt == "PNG" else ".tif"
+        self._remember_save_options()
+        if self.rad_auto.isChecked():
+            stem = naming.auto_stem(self.path, self.txt_suffix.text())
+            s.out_psd = stem + ".psd" if psd else None
+            s.out_flat = stem + ext if flat else None
+            for p in (s.out_psd, s.out_flat):
+                if p and os.path.exists(p):          # can't happen, but never overwrite
+                    QtWidgets.QMessageBox.warning(self, "PSD Prep", f"{p} already exists.")
+                    return
+            self._run(process, self.doc, s, on_done=self._exported)
+            return
+        base = naming.base_name(self.path, self.txt_suffix.text())
         outdir = self.settings.value("out_dir", os.path.dirname(self.path))
-        stem = os.path.join(outdir, os.path.basename(base))
+        stem = os.path.join(outdir, base)
         if psd:
             p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PSD", stem + "_edit.psd",
                                                          "Photoshop (*.psd)")
@@ -771,15 +930,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             if not p.lower().endswith((".psd", ".psb")):
                 p += ".psd"
-            if os.path.abspath(p) == os.path.abspath(self.path):
+            if naming.is_same_file(p, self.path):
                 QtWidgets.QMessageBox.warning(self, "PSD Prep", "Choose a new name — the original "
                                               "file is never overwritten.")
                 return
             s.out_psd = p
             stem = os.path.splitext(p)[0]
         if flat:
-            fmt = self.cmb_fmt.currentText()
-            ext = ".png" if fmt == "PNG" else ".tif"
             p, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Export flattened image", stem + ext,
                 "PNG (*.png);;TIFF (*.tif *.tiff)" if fmt == "PNG" else "TIFF (*.tif *.tiff);;PNG (*.png)")
@@ -787,18 +944,67 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             if not p.lower().endswith((".png", ".tif", ".tiff")):
                 p += ext
+            if naming.is_same_file(p, self.path):
+                QtWidgets.QMessageBox.warning(self, "PSD Prep", "The original file is never overwritten.")
+                return
             s.out_flat = p
             self.settings.setValue("fmt", fmt)
         self.settings.setValue("out_dir", os.path.dirname(s.out_psd or s.out_flat))
         self._run(process, self.doc, s, on_done=self._exported)
 
     def _exported(self, res):
-        msg = "Done"
-        if res.get("psd"):
-            msg += f" — {os.path.basename(res['psd'])}"
-        if res.get("flat"):
-            msg += f" — {os.path.basename(res['flat'])}"
-        self.statusBar().showMessage(msg + f" (image {res['composite_source']})", 10000)
+        files = res.get("written") or [res[k] for k in ("psd", "flat") if res.get(k)]
+        msg = "Saved " + ", ".join(os.path.basename(f) for f in files[:4])
+        if len(files) > 4:
+            msg += f" … ({len(files)} files)"
+        self.statusBar().showMessage(msg, 15000)
+        self.log(msg)
+        self._update_next_name()
+
+    def _remember_save_options(self):
+        self.settings.setValue("save_mode", "auto" if self.rad_auto.isChecked() else "ask")
+        self.settings.setValue("suffix", self.txt_suffix.text())
+        self.settings.setValue("fmt", self.cmb_fmt.currentText())
+
+    def _update_next_name(self, *a):
+        if not self.path:
+            self.lbl_next.setText("")
+            return
+        if self.rad_auto.isChecked():
+            stem = os.path.basename(naming.auto_stem(self.path, self.txt_suffix.text()))
+            ext = ".png" if self.cmb_fmt.currentText() == "PNG" else ".tif"
+            self.lbl_next.setText(f"Next: {stem}.psd / {ext}\nin {os.path.dirname(self.path)}")
+        else:
+            self.lbl_next.setText("You pick the file name each time.")
+
+    def export_boards(self):
+        if not self.doc:
+            return
+        boards = self._selected_boards()
+        if not boards:
+            QtWidgets.QMessageBox.information(self, "PSD Prep", "Tick at least one artboard.")
+            return
+        want_psd = self.chk_board_psd.isChecked()
+        ext = (".png" if self.cmb_fmt.currentText() == "PNG" else ".tif") \
+            if self.chk_board_flat.isChecked() else None
+        if not want_psd and not ext:
+            QtWidgets.QMessageBox.information(self, "PSD Prep", "Tick PSD and/or Flattened.")
+            return
+        self._remember_save_options()
+        if self.rad_auto.isChecked():
+            stem = naming.auto_stem(self.path, self.txt_suffix.text())
+        else:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Folder for the artboards", self.settings.value("out_dir", os.path.dirname(self.path)))
+            if not folder:
+                return
+            self.settings.setValue("out_dir", folder)
+            base = naming.base_name(self.path, self.txt_suffix.text())
+            stem = os.path.join(folder, f"{base}_v{naming.next_version(folder, base)}")
+        s = self._settings()
+        s.source_path = self.path
+        s.artboard_transparent = self.chk_board_transp.isChecked()
+        self._run(export_artboards, self.doc, s, boards, stem, want_psd, ext, on_done=self._exported)
 
     # -- threading ------------------------------------------------------------
     def _run(self, fn, *args, on_done=None):
