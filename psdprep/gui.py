@@ -398,8 +398,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setColumnWidth(0, 220)
         self.tree.setColumnWidth(1, 40)
         self.tree.setColumnWidth(2, 90)
+        self.tree.setSelectionMode(E(QtWidgets.QAbstractItemView, "SelectionMode", "ExtendedSelection"))
+        self.tree.setContextMenuPolicy(E(Qt, "ContextMenuPolicy", "CustomContextMenu"))
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.setToolTip("Ctrl/Shift-click to select several layers; clicking one eye or tick "
+                             "then sets all of them. Right-click for more.")
         self.tree.itemChanged.connect(self._item_changed)
         lv.addWidget(self.tree, 1)
+        srow = QtWidgets.QHBoxLayout()
+        for label, fn in (("Show selected", lambda: self._set_selected(1, True)),
+                          ("Hide selected", lambda: self._set_selected(1, False))):
+            btn = QtWidgets.QPushButton(label)
+            btn.clicked.connect(fn)
+            srow.addWidget(btn)
+        lv.addLayout(srow)
         grid = QtWidgets.QGridLayout()
         for label, fn, tip, (row, col, span) in (
                 ("Show all", self.show_all, "Turn every layer's eye on", (0, 0, 1)),
@@ -725,6 +737,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_highlight.setEnabled(False)
         self.chk_highlight.blockSignals(False)
         self.lbl_check.setText("Hover the image to compare source and converted values.")
+        # CMYK files default to your last colour space (sRGB at first); everything
+        # else opens with "No conversion"
+        self.cmb_target.blockSignals(True)
+        if doc.mode == MODE_CMYK:
+            last = self.settings.value("target", colorspaces.DEFAULT_TARGET)
+            self.cmb_target.setCurrentIndex(max(1, self.cmb_target.findData(last)))
+        else:
+            self.cmb_target.setCurrentIndex(0)
+        self.cmb_target.blockSignals(False)
         self._colour_changed()
         self.txt_name.blockSignals(True)
         self.txt_name.setText(naming.base_name(path, self.txt_suffix.text()))
@@ -880,12 +901,63 @@ class MainWindow(QtWidgets.QMainWindow):
     def _item_changed(self, item, col):
         if self._building:
             return
-        if col == 0:
-            keep = item.checkState(0) == CHECKED
+        state = item.checkState(col)
+        selected = self.tree.selectedItems()
+        if item in selected and len(selected) > 1 and col in (0, 1):
+            # one click on an eye (or tick) of a selected layer sets them all
             self._building = True
-            self._set_children_enabled(item, keep)
+            for it in selected:
+                if it is not item and not it.isDisabled():
+                    it.setCheckState(col, state)
+            self._building = False
+            # the click would collapse the selection: keep it
+            QtCore.QTimer.singleShot(0, lambda sel=list(selected): self._reselect(sel))
+        if col == 0:
+            self._building = True
+            for it in (selected if (item in selected and len(selected) > 1) else [item]):
+                self._set_children_enabled(it, it.checkState(0) == CHECKED)
             self._building = False
         self.schedule_preview()
+
+    def _reselect(self, items):
+        self.tree.blockSignals(True)
+        for it in items:
+            it.setSelected(True)
+        self.tree.blockSignals(False)
+
+    def _set_selected(self, col, on):
+        """Show/hide (col 1) or keep/remove (col 0) every selected layer."""
+        sel = self.tree.selectedItems()
+        if not sel:
+            self.statusBar().showMessage("Select layers first (Ctrl/Shift-click)", 4000)
+            return
+        self._building = True
+        for it in sel:
+            it.setCheckState(col, CHECKED if on else UNCHECKED)
+        if col == 0:
+            for it in sel:
+                self._set_children_enabled(it, on)
+        self._building = False
+        self.schedule_preview()
+
+    def _tree_menu(self, pos):
+        if not self.tree.selectedItems():
+            it = self.tree.itemAt(pos)
+            if it is None:
+                return
+            it.setSelected(True)
+        menu = QtWidgets.QMenu(self)
+        n = len(self.tree.selectedItems())
+        what = f"{n} layers" if n > 1 else "layer"
+        menu.addAction(f"Show {what}", lambda: self._set_selected(1, True))
+        menu.addAction(f"Hide {what}", lambda: self._set_selected(1, False))
+        menu.addSeparator()
+        menu.addAction(f"Remove {what}", lambda: self._set_selected(0, False))
+        menu.addAction(f"Keep {what}", lambda: self._set_selected(0, True))
+        menu.addSeparator()
+        menu.addAction("Select all", self.tree.selectAll)
+        menu.exec(self.tree.viewport().mapToGlobal(pos)) if hasattr(menu, "exec") else \
+            menu.exec_(self.tree.viewport().mapToGlobal(pos))
 
     def _set_children_enabled(self, item, on):
         for i in range(item.childCount()):

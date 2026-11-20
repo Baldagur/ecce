@@ -119,6 +119,7 @@ def _gui(tmp):
     assert w.doc is not None, "file did not load"
     app.processEvents()
     assert len(w.items) == 6, f"tree has {len(w.items)} items"
+    assert w.cmb_target.currentData() is not None, "CMYK file should default to a conversion"
     assert w.view.pix.pixmap().width() > 0, "empty preview"
     hidden_in_file = {i for i, L in enumerate(w.doc.layers) if not L.visible and not L.is_divider}
     w.show_all()
@@ -129,6 +130,17 @@ def _gui(tmp):
     w.reset_layers()
     assert {i for i, v in w._visibility().items() if not v} == hidden_in_file
     assert not w._removed()
+    # multi-select: one eye click sets every selected layer; buttons too
+    items = [w.items[i] for i in sorted(w.items)][:3]
+    w.tree.clearSelection()
+    for it in items:
+        it.setSelected(True)
+    items[0].setCheckState(1, gui.UNCHECKED)
+    assert all(it.checkState(1) == gui.UNCHECKED for it in items), "multi-hide failed"
+    w._set_selected(1, True)
+    assert all(it.checkState(1) == gui.CHECKED for it in items), "show selected failed"
+    w.tree.clearSelection()
+    w.reset_layers()
     w.remove_hidden()
     removed = {w.doc.layers[i].name for i in w._removed()}
     assert removed == {"Hidden"}, removed
@@ -220,6 +232,7 @@ def _gui(tmp):
         w._open_vector(ai, dpi=144)
         wait()
         assert w.doc.source_kind == "vector" and w.lst_boards.count() == 2
+        assert w.cmb_target.currentData() is None, "non-CMYK file should default to No conversion"
         assert not w.act_psd.isEnabled() and w.act_flat.isEnabled()
         w.export_boards()
         wait()

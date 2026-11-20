@@ -15,7 +15,10 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
 ```
 
 * **Layers panel**: untick a layer to remove it. Removing a group removes everything in it.
-  The eye column toggles visibility. **Show all** / **Hide all** turn every eye on or off.
+  The eye column toggles visibility. **Ctrl/Shift-click** selects several layers: clicking
+  the eye (or tick) of one of them then sets all of them. **Show selected** / **Hide selected**
+  and the right-click menu (Show / Hide / Remove / Keep) do the same.
+  **Show all** / **Hide all** turn every eye on or off.
   **Reset to original** puts the layers back exactly as the file was saved: the same layers
   visible and hidden, nothing removed. **Remove hidden** unticks every hidden layer, and
   **Keep all** ticks everything again.
@@ -26,7 +29,8 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   * **sRGB** (default).
   * **Rec.709 (gamma 2.4)**: BT.1886, what a Rec.709 monitor and Flame's "Rec.709 video" use.
   * **Rec.709 (camera OETF)**: Nuke's `rec709`.
-  * **No conversion**.
+  * **No conversion**: the default for anything that isn't CMYK. CMYK files open set to
+    your last choice (sRGB the first time).
 
   CMYK uses the file's embedded profile. If there isn't one, it uses the profile bundled with
   the app (searched before any system profiles, so every workstation matches); the Original panel
