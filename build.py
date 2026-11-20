@@ -46,6 +46,8 @@ args = [
     "--hidden-import", "psdprep.fixtures",
     "--hidden-import", "psdprep.desktop",
     "--hidden-import", "psdprep.vector",
+    "--hidden-import", "psdprep.check",
+    "--hidden-import", "psdprep.colorspaces",
     "--collect-all", "pypdfium2",
     "--collect-all", "pypdfium2_raw",
     "--hidden-import", "psdprep._build_stamp",

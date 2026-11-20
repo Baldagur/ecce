@@ -67,6 +67,14 @@ def _pipeline(tmp):
         assert o.merged_has_alpha and "Background" not in [L.name for L in o.layers]
         assert os.path.getsize(s.out_flat) > 1000
         out.append(f"{depth}-bit ok")
+    if path:
+        from . import check, ops
+        d = make_doc(8)
+        for target in ("srgb", "rec709"):
+            conv = ops.ColorConverter(d.mode, 8, None, path, target=target)
+            res = check.conversion_check(d, conv, 1)
+            assert res.ok, res.message
+        out.append(f"colour check ΔE95 {res.stats['p95']:.2f}")
     return ", ".join(out) + f"; CMYK profile: {desc or 'none found (simple formula)'}"
 
 
@@ -131,15 +139,27 @@ def _gui(tmp):
     w.spins[0].setValue(5)
     app.processEvents()
     assert w.view.crop[0] == 5
-    w.chk_convert.setChecked(True)
+    w.cmb_target.setCurrentIndex(w.cmb_target.findData("srgb"))
     w.refresh_preview()
     app.processEvents()
+
     def wait(limit=60):
         t0 = time.time()
         while w.thread is not None and time.time() - t0 < limit:
             app.processEvents()
             time.sleep(0.01)
         app.processEvents()
+
+    # colour check: measured report, highlight overlay, pixel probe
+    w.check_conversion()
+    wait()
+    msg = w.lbl_check.text()
+    assert "ΔE2000" in msg or "no colour profile" in msg, msg
+    if w.chk_highlight.isEnabled():
+        w.chk_highlight.setChecked(True)
+        app.processEvents()
+    w._probe(60, 60)
+    assert "CMYK" in w.statusBar().currentMessage(), w.statusBar().currentMessage()
 
     before = open(src, "rb").read()
     # auto-named save next to the original: v1, then v2
@@ -151,11 +171,24 @@ def _gui(tmp):
     w.export(psd=True, flat=False)
     wait()
     made = sorted(f for f in os.listdir(tmp) if f.startswith("gui_in_cleanup"))
-    assert made == ["gui_in_cleanup_v1.png", "gui_in_cleanup_v1.psd", "gui_in_cleanup_v2.psd"], made
-    o = read_psd(os.path.join(tmp, "gui_in_cleanup_v1.psd"))
+    assert made == ["gui_in_cleanup_v1_sRGB.png", "gui_in_cleanup_v1_sRGB.psd",
+                    "gui_in_cleanup_v2_sRGB.psd"], made
+    o = read_psd(os.path.join(tmp, "gui_in_cleanup_v1_sRGB.psd"))
     assert (o.width, o.height) == (w.view.crop[2], w.view.crop[3])
     assert "v3" in w.lbl_next.text(), w.lbl_next.text()
     assert open(src, "rb").read() == before, "original changed"
+    # Rec.709 into another folder with a custom name
+    out = os.path.join(tmp, "deliveries")
+    os.makedirs(out)
+    w.cmb_target.setCurrentIndex(w.cmb_target.findData("rec709"))
+    w.rad_custom.setChecked(True)
+    w.txt_folder.setText(out)
+    w.txt_name.setText("client logo")
+    w.export(psd=False, flat=True)
+    wait()
+    assert os.listdir(out) == ["client_logo_v1_Rec709.png"], os.listdir(out)
+    w.rad_auto.setChecked(True)
+    w.cmb_target.setCurrentIndex(w.cmb_target.findData("srgb"))
     assert w.orig["mode"].text().find("CMYK") >= 0
 
     # artboards: list, reorder, export each one
@@ -174,8 +207,8 @@ def _gui(tmp):
     w.export_boards()
     wait()
     made = sorted(f for f in os.listdir(tmp) if f.startswith("boards_cleanup"))
-    assert made == ["boards_cleanup_v1_01_Square.png", "boards_cleanup_v1_01_Square.psd",
-                    "boards_cleanup_v1_02_Banner.png", "boards_cleanup_v1_02_Banner.psd"], made
+    assert made == ["boards_cleanup_v1_01_Square_sRGB.png", "boards_cleanup_v1_01_Square_sRGB.psd",
+                    "boards_cleanup_v1_02_Banner_sRGB.png", "boards_cleanup_v1_02_Banner_sRGB.psd"], made
     # Illustrator file through the window (resolution dialog bypassed)
     try:
         import pypdfium2  # noqa: F401
@@ -189,8 +222,8 @@ def _gui(tmp):
         w.export_boards()
         wait()
         made_ai = sorted(f for f in os.listdir(tmp) if f.startswith("gui_logo_cleanup"))
-        assert made_ai == ["gui_logo_cleanup_v1_01_Artboard_1.png",
-                           "gui_logo_cleanup_v1_02_Artboard_2.png"], made_ai
+        assert made_ai == ["gui_logo_cleanup_v1_01_Artboard_1_sRGB.png",
+                           "gui_logo_cleanup_v1_02_Artboard_2_sRGB.png"], made_ai
     except ImportError:
         pass
     w.close()

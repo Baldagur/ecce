@@ -17,9 +17,10 @@ except ImportError:  # pragma: no cover
     from PySide2.QtCore import Signal
     QT6 = False
 
-from . import artboards as ab_mod, naming, ops, __version__
+from . import artboards as ab_mod, check as check_mod, colorspaces, naming, ops, __version__
 from .version import BUILD
-from .pipeline import Settings, export_artboards, make_converter, process, use_saved_composite
+from .pipeline import (Settings, colour_tag, export_artboards, make_converter, process,
+                       use_saved_composite)
 from .psdfile import MODE_CMYK, MODE_NAMES, MODE_RGB, read_psd
 
 Qt = QtCore.Qt
@@ -65,6 +66,10 @@ class Worker(QtCore.QObject):
 
 def _load(path, log=None, progress=None):
     return read_psd(path)
+
+
+def _run_check(doc, conv, scale, hidden, log=None, progress=None):
+    return check_mod.conversion_check(doc, conv, scale, hidden)
 
 
 def _load_vector(path, dpi, long_side, log=None, progress=None):
@@ -139,6 +144,7 @@ class ResolutionDialog(QtWidgets.QDialog):
 # ---------------------------------------------------------------------------
 class PreviewView(QtWidgets.QGraphicsView):
     cropChanged = Signal(object)      # (x, y, w, h) in document pixels, or None
+    hovered = Signal(int, int)        # document pixel under the mouse
 
     HANDLE = 8
 
@@ -295,6 +301,7 @@ class PreviewView(QtWidgets.QGraphicsView):
             return
         if self._drag is None:
             self.viewport().setCursor(self._cursor_for(self._hit(p)))
+            self.hovered.emit(int(sp.x()), int(sp.y()))
             return
         kind, start, orig = self._drag
         if kind == "new":
@@ -454,11 +461,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # colour
         g = QtWidgets.QGroupBox("Colour")
         f = QtWidgets.QFormLayout(g)
-        self.chk_convert = QtWidgets.QCheckBox("Convert CMYK to sRGB")
-        self.chk_convert.setChecked(True)
-        self.chk_convert.setEnabled(False)
-        f.addRow(self.chk_convert)
+        self.cmb_target = QtWidgets.QComboBox()
+        self.cmb_target.addItem("No conversion", None)
+        for key, t in colorspaces.TARGETS.items():
+            self.cmb_target.addItem(t.label, key)
+            self.cmb_target.setItemData(self.cmb_target.count() - 1, t.tooltip,
+                                        E(Qt, "ItemDataRole", "ToolTipRole"))
+        last = self.settings.value("target", colorspaces.DEFAULT_TARGET)
+        self.cmb_target.setCurrentIndex(max(1, self.cmb_target.findData(last)))
+        f.addRow("Convert to", self.cmb_target)
+        self.btn_check = QtWidgets.QPushButton("Check conversion")
+        self.btn_check.setToolTip("Measure every converted pixel against the source colour profile "
+                                  "(ΔE2000) and highlight anything that changed visibly")
+        self.btn_check.clicked.connect(self.check_conversion)
+        f.addRow(self.btn_check)
+        self.chk_highlight = QtWidgets.QCheckBox("Highlight pixels with ΔE > 2")
+        self.chk_highlight.setEnabled(False)
+        self.chk_highlight.toggled.connect(lambda *_: self.refresh_preview())
+        f.addRow(self.chk_highlight)
+        self.lbl_check = QtWidgets.QLabel("Hover the image to compare source and converted values.")
+        self.lbl_check.setWordWrap(True)
+        self.lbl_check.setStyleSheet("color: #999;")
+        self.lbl_check.setTextInteractionFlags(E(Qt, "TextInteractionFlag", "TextSelectableByMouse"))
+        f.addRow(self.lbl_check)
         rv.addWidget(g)
+        self.de_map = None
         # Fixed conversion settings (Photoshop's defaults): the file's embedded
         # profile, else the bundled generic CMYK profile; relative colorimetric + BPC.
         found = ops.find_cmyk_profiles()
@@ -515,20 +542,36 @@ class MainWindow(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox("Save to")
         f = QtWidgets.QFormLayout(g)
         self.rad_auto = QtWidgets.QRadioButton("Next to the original, auto-named")
-        self.rad_ask = QtWidgets.QRadioButton("Ask where to save")
-        (self.rad_ask if self.settings.value("save_mode", "auto") == "ask" else self.rad_auto).setChecked(True)
+        self.rad_custom = QtWidgets.QRadioButton("Other folder and name")
+        self.rad_ask = QtWidgets.QRadioButton("Ask where to save each time")
+        mode = self.settings.value("save_mode", "auto")
+        {"ask": self.rad_ask, "custom": self.rad_custom}.get(mode, self.rad_auto).setChecked(True)
         f.addRow(self.rad_auto)
-        f.addRow(self.rad_ask)
         self.txt_suffix = QtWidgets.QLineEdit(self.settings.value("suffix", naming.DEFAULT_SUFFIX))
         self.txt_suffix.setPlaceholderText("e.g. cleanup")
         f.addRow("Name suffix", self.txt_suffix)
+        f.addRow(self.rad_custom)
+        frow = QtWidgets.QHBoxLayout()
+        self.txt_folder = QtWidgets.QLineEdit(self.settings.value("custom_folder", ""))
+        self.txt_folder.setPlaceholderText("output folder")
+        bf = QtWidgets.QToolButton()
+        bf.setText("…")
+        bf.clicked.connect(self._browse_folder)
+        frow.addWidget(self.txt_folder, 1)
+        frow.addWidget(bf)
+        f.addRow("Folder", frow)
+        self.txt_name = QtWidgets.QLineEdit("")
+        self.txt_name.setPlaceholderText("file name (version and colour space are added)")
+        f.addRow("Name", self.txt_name)
+        f.addRow(self.rad_ask)
         self.lbl_next = QtWidgets.QLabel("")
         self.lbl_next.setWordWrap(True)
         self.lbl_next.setStyleSheet("color: #999;")
         f.addRow(self.lbl_next)
-        for w in (self.rad_auto, self.rad_ask):
+        for w in (self.rad_auto, self.rad_custom, self.rad_ask):
             w.toggled.connect(self._update_next_name)
-        self.txt_suffix.textChanged.connect(self._update_next_name)
+        for w in (self.txt_suffix, self.txt_folder, self.txt_name):
+            w.textChanged.connect(self._update_next_name)
         self.cmb_fmt.currentIndexChanged.connect(self._update_next_name)
         rv.addWidget(g)
 
@@ -578,7 +621,8 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setSizes([330, 820, 350])
         self.boards = []
 
-        self.chk_convert.toggled.connect(self._colour_changed)
+        self.cmb_target.currentIndexChanged.connect(self._colour_changed)
+        self.view.hovered.connect(self._probe)
         self.cmb_source.currentIndexChanged.connect(self.schedule_preview)
 
     def _set_enabled(self, on):
@@ -657,12 +701,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fill_tree()
         self._update_info()
         self._set_enabled(True)
-        is_cmyk = doc.mode == MODE_CMYK
-        self.chk_convert.blockSignals(True)
-        self.chk_convert.setEnabled(is_cmyk)
-        self.chk_convert.setChecked(is_cmyk)
-        self.chk_convert.blockSignals(False)
+        self.de_map = None
+        self.chk_highlight.blockSignals(True)
+        self.chk_highlight.setChecked(False)
+        self.chk_highlight.setEnabled(False)
+        self.chk_highlight.blockSignals(False)
+        self.lbl_check.setText("Hover the image to compare source and converted values.")
         self._colour_changed()
+        self.txt_name.blockSignals(True)
+        self.txt_name.setText(naming.base_name(path, self.txt_suffix.text()))
+        self.txt_name.blockSignals(False)
         self.boards = ab_mod.find_artboards(doc)
         self._fill_boards(self.boards)
         self.refresh_preview(fit=True)
@@ -913,7 +961,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return Settings(
             remove=self._removed(), visibility=self._visibility(), crop=self.view.crop,
             delete_cropped=self.chk_delete.isChecked(),
-            convert=self.chk_convert.isEnabled() and self.chk_convert.isChecked(),
+            convert=self.cmb_target.currentData() is not None,
+            target=self.cmb_target.currentData() or "srgb",
             use_embedded=True, cmyk_profile=self.cmyk_profile,
             intent="Relative Colorimetric", bpc=True,
             flatten_source=["auto", "layers", "composite"][self.cmb_source.currentIndex()],
@@ -921,14 +970,66 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _colour_changed(self, *a):
         self.rgb_cache = {}
+        if self.cmb_target.currentData():
+            self.settings.setValue("target", self.cmb_target.currentData())
+        self.de_map = None
+        self.chk_highlight.setChecked(False)
+        self.chk_highlight.setEnabled(False)
         if self.doc:
-            if self.doc.mode == MODE_CMYK:
-                conv = make_converter(self.doc, self._settings())
-                self.chk_convert.setToolTip(f"Uses {conv.source_desc}")
-            else:
-                self.chk_convert.setToolTip("Only CMYK files are converted; this file is "
-                                            f"{MODE_NAMES.get(self.doc.mode)} and stays as it is.")
+            conv = make_converter(self.doc, self._settings())
+            self.cmb_target.setToolTip(f"Source: {conv.source_desc}")
+        self._update_next_name()
         self.schedule_preview()
+
+    def _display_converter(self):
+        """Converter for what the preview shows: the chosen target, or sRGB
+        display of an unconverted file."""
+        s = self._settings()
+        conv = make_converter(self.doc, s)
+        if self.doc.mode == MODE_RGB and not s.convert:
+            return None
+        return conv
+
+    def check_conversion(self):
+        if not self.doc:
+            return
+        s = self._settings()
+        if not s.convert:
+            self.lbl_check.setText("Choose a colour space in 'Convert to' first.")
+            return
+        hidden = {id(self.doc.layers[i]) for i in s.remove}
+        hidden |= {id(self.doc.layers[i]) for i, v in s.visibility.items() if not v}
+        conv = make_converter(self.doc, s)
+        self._run(_run_check, self.doc, conv, self.scale, hidden, on_done=self._checked)
+
+    def _checked(self, res):
+        self.lbl_check.setText(res.message)
+        self.log(res.message)
+        self.de_map = res.de_map
+        self.chk_highlight.setEnabled(res.de_map is not None)
+        if res.de_map is not None and not res.ok:
+            self.chk_highlight.setChecked(True)
+        self.refresh_preview()
+
+    def _probe(self, x, y):
+        if not self.doc or self.thread is not None:
+            return
+        s = self._settings()
+        conv = make_converter(self.doc, s)
+        hidden = {id(self.doc.layers[i]) for i in s.remove}
+        hidden |= {id(self.doc.layers[i]) for i, v in s.visibility.items() if not v}
+        try:
+            r = check_mod.probe(self.doc, conv, x, y, hidden)
+        except Exception:
+            r = None
+        if r is None:
+            return
+        txt = f"{x}, {y} · {r['layer']}: {r['source']}"
+        if s.convert:
+            txt += f"  →  {r['target']} {r['out']}"
+            if r["de"] is not None:
+                txt += f"  (ΔE {r['de']:.1f})"
+        self.statusBar().showMessage(txt)
 
     def schedule_preview(self, *a):
         if self.doc:
@@ -938,9 +1039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.doc:
             return
         doc, s = self.doc, self._settings()
-        conv = make_converter(doc, s)
-        if doc.mode == MODE_RGB:
-            conv = None
+        conv = self._display_converter()
         try:
             if use_saved_composite(doc, s):
                 rgb, alpha = ops.merged_rgba(doc, conv, self.scale)
@@ -965,7 +1064,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"Preview failed: {e}")
             return
-        img = self._to_qimage(rgb, alpha)
+        overlay = self.de_map if (self.chk_highlight.isChecked() and self.de_map is not None) else None
+        img = self._to_qimage(rgb, alpha, overlay)
         self.view.set_image(img, doc.width, doc.height, keep_view=not fit)
         self.setStatusTip(src)
         self.statusBar().showMessage(f"Preview: {src}" + (f" · 1/{self.scale} scale" if self.scale > 1 else ""))
@@ -1005,11 +1105,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return get
 
     @staticmethod
-    def _to_qimage(rgb, alpha):
+    def _to_qimage(rgb, alpha, de_map=None):
         h, w = alpha.shape
         yy, xx = np.mgrid[0:h, 0:w]
         checker = np.where(((yy // 12) + (xx // 12)) % 2 == 0, 0.42, 0.32).astype(np.float32)
         out = rgb * alpha[..., None] + checker[..., None] * (1 - alpha[..., None])
+        if de_map is not None and de_map.shape == alpha.shape:
+            bad = np.nan_to_num(de_map, nan=0.0) > check_mod.THRESHOLD
+            stripes = ((yy + xx) // 4) % 2 == 0
+            out = out.copy()
+            out[bad & stripes] = (1.0, 0.0, 1.0)            # magenta hatch where ΔE > 2
         buf = np.ascontiguousarray(np.clip(out * 255 + 0.5, 0, 255).astype(np.uint8))
         img = QtGui.QImage(buf.tobytes(), w, h, 3 * w, E(QtGui.QImage, "Format", "Format_RGB888"))
         return img.copy()
@@ -1023,8 +1128,12 @@ class MainWindow(QtWidgets.QMainWindow):
         fmt = self.cmb_fmt.currentText()
         ext = ".png" if fmt == "PNG" else ".tif"
         self._remember_save_options()
-        if self.rad_auto.isChecked():
-            stem = naming.auto_stem(self.path, self.txt_suffix.text())
+        tag = colour_tag(self.doc, s)
+        if not self.rad_ask.isChecked():
+            stem = self._versioned_stem()
+            if stem is None:
+                return
+            stem = naming.with_tag(stem, tag)
             s.out_psd = stem + ".psd" if psd else None
             s.out_flat = stem + ext if flat else None
             for p in (s.out_psd, s.out_flat):
@@ -1033,11 +1142,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
             self._run(process, self.doc, s, on_done=self._exported)
             return
-        base = naming.base_name(self.path, self.txt_suffix.text())
         outdir = self.settings.value("out_dir", os.path.dirname(self.path))
-        stem = os.path.join(outdir, base)
+        stem = naming.with_tag(naming.custom_stem(outdir, naming.base_name(self.path, self.txt_suffix.text())), tag)
         if psd:
-            p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PSD", stem + "_edit.psd",
+            p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PSD", stem + ".psd",
                                                          "Photoshop (*.psd)")
             if not p:
                 return
@@ -1091,20 +1199,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_next_name()
 
     def _remember_save_options(self):
-        self.settings.setValue("save_mode", "auto" if self.rad_auto.isChecked() else "ask")
+        mode = "auto" if self.rad_auto.isChecked() else "custom" if self.rad_custom.isChecked() else "ask"
+        self.settings.setValue("save_mode", mode)
         self.settings.setValue("suffix", self.txt_suffix.text())
+        self.settings.setValue("custom_folder", self.txt_folder.text())
         self.settings.setValue("fmt", self.cmb_fmt.currentText())
 
+    def _browse_folder(self):
+        start = self.txt_folder.text() or (os.path.dirname(self.path) if self.path else "")
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Output folder", start)
+        if d:
+            self.txt_folder.setText(d)
+            self.rad_custom.setChecked(True)
+
+    def _versioned_stem(self, quiet=False):
+        """<folder>/<name>_v<N> for the auto / custom modes (None if unusable)."""
+        if self.rad_auto.isChecked():
+            return naming.auto_stem(self.path, self.txt_suffix.text())
+        folder = self.txt_folder.text().strip()
+        if not folder or not os.path.isdir(folder):
+            if not quiet:
+                QtWidgets.QMessageBox.information(self, "PSD Prep", "Pick an existing output folder first.")
+            return None
+        if not os.access(folder, os.W_OK):
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "PSD Prep", f"Can't write to {folder}.")
+            return None
+        name = self.txt_name.text().strip() or naming.base_name(self.path, self.txt_suffix.text())
+        return naming.custom_stem(folder, name)
+
     def _update_next_name(self, *a):
-        if not self.path:
+        if not self.path or not self.doc:
             self.lbl_next.setText("")
             return
-        if self.rad_auto.isChecked():
-            stem = os.path.basename(naming.auto_stem(self.path, self.txt_suffix.text()))
-            ext = ".png" if self.cmb_fmt.currentText() == "PNG" else ".tif"
-            self.lbl_next.setText(f"Next: {stem}.psd / {ext}\nin {os.path.dirname(self.path)}")
-        else:
+        if self.rad_ask.isChecked():
             self.lbl_next.setText("You pick the file name each time.")
+            return
+        stem = self._versioned_stem(quiet=True)
+        if stem is None:
+            self.lbl_next.setText("Pick an output folder.")
+            return
+        stem = naming.with_tag(stem, colour_tag(self.doc, self._settings()))
+        ext = ".png" if self.cmb_fmt.currentText() == "PNG" else ".tif"
+        self.lbl_next.setText(f"Next: {os.path.basename(stem)}.psd / {ext}\nin {os.path.dirname(stem)}")
 
     def export_boards(self):
         if not self.doc:
@@ -1120,30 +1257,32 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "PSD Prep", "Tick PSD and/or Flattened.")
             return
         self._remember_save_options()
-        if self.rad_auto.isChecked():
-            stem = naming.auto_stem(self.path, self.txt_suffix.text())
+        if not self.rad_ask.isChecked():
+            stem = self._versioned_stem()
+            if stem is None:
+                return
         else:
             folder = QtWidgets.QFileDialog.getExistingDirectory(
                 self, "Folder for the artboards", self.settings.value("out_dir", os.path.dirname(self.path)))
             if not folder:
                 return
             self.settings.setValue("out_dir", folder)
-            base = naming.base_name(self.path, self.txt_suffix.text())
-            stem = os.path.join(folder, f"{base}_v{naming.next_version(folder, base)}")
+            stem = naming.custom_stem(folder, naming.base_name(self.path, self.txt_suffix.text()))
         s = self._settings()
         s.source_path = self.path
         s.artboard_transparent = self.chk_board_transp.isChecked()
-        self._run(export_artboards, self.doc, s, boards, stem, want_psd, ext, on_done=self._exported)
+        self._run(export_artboards, self.doc, s, boards, stem, want_psd, ext, on_done=self._exported,
+                  tag=colour_tag(self.doc, s))
 
     # -- threading ------------------------------------------------------------
-    def _run(self, fn, *args, on_done=None):
+    def _run(self, fn, *args, on_done=None, **kwargs):
         if self.thread is not None:
             return
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.setEnabled(False)
         self.thread = QtCore.QThread(self)
-        self.worker = Worker(fn, *args)
+        self.worker = Worker(fn, *args, **kwargs)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.log)

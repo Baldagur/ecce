@@ -205,11 +205,16 @@ def srgb_profile_bytes() -> Optional[bytes]:
 
 
 class ColorConverter:
-    """Converts raw PSD colour channels of one document to sRGB."""
+    """Converts raw PSD colour channels of one document to an RGB target
+    (sRGB, Rec.709 ...; see colorspaces.TARGETS)."""
 
     def __init__(self, mode: int, depth: int, embedded: Optional[bytes] = None,
                  fallback_profile: Optional[str] = None, intent: str = "Relative Colorimetric",
-                 bpc: bool = True, use_embedded: bool = True):
+                 bpc: bool = True, use_embedded: bool = True, target: str = "srgb"):
+        from . import colorspaces
+        self.target = target if target in colorspaces.TARGETS else "srgb"
+        self.src_profile = None             # source ICC bytes actually used (for checks)
+        self._lab_transform = None
         self.mode, self.depth = mode, depth
         self.max = 255.0 if depth == 8 else 65535.0
         self.intent = intent
@@ -227,8 +232,9 @@ class ColorConverter:
                     import io
                     flags = 0x2000 if bpc else 0
                     t = ImageCms.buildTransform(ImageCms.ImageCmsProfile(io.BytesIO(embedded)),
-                                                ImageCms.createProfile("sRGB"), "L", "RGB",
+                                                colorspaces.pil_profile(self.target), "L", "RGB",
                                                 INTENTS.get(intent, 1), flags)
+                    self.src_profile = embedded
                     ramp = Image.frombytes("L", (256, 1), bytes(range(256)))
                     out = np.asarray(ImageCms.applyTransform(ramp, t), np.float32).reshape(256, 3)
                     self._gray_lut = out / 255.0
@@ -256,7 +262,8 @@ class ColorConverter:
         try:
             from PIL import ImageCms
             import io
-            dst = ImageCms.createProfile("sRGB")
+            dst = colorspaces.pil_profile(self.target)
+            self.src_profile = prof_bytes
             flags = 0
             if bpc:
                 flags |= int(getattr(getattr(ImageCms, "Flags", None), "BLACKPOINTCOMPENSATION", 0x2000))
@@ -340,19 +347,22 @@ class ColorConverter:
         h, w = chans[0].shape
         if h == 0 or w == 0:
             return np.zeros((h, w, 3), np.float32)
+        from .colorspaces import reencode_from_srgb
         if self.method == "gray":
             g = chans[0].astype(np.float32) / self.max
             if self._gray_lut is None:
-                return np.repeat(g[:, :, None], 3, axis=2)
+                return reencode_from_srgb(np.repeat(g[:, :, None], 3, axis=2), self.target)
             xs = np.linspace(0, 1, 256, dtype=np.float32)
             return np.stack([np.interp(g, xs, self._gray_lut[:, c]).astype(np.float32)
                              for c in range(3)], axis=-1)
-        if self.method == "identity":
-            return np.stack(chans[:3], axis=-1).astype(np.float32) / self.max
+        if self.method == "identity":            # untagged RGB = sRGB
+            return reencode_from_srgb(np.stack(chans[:3], axis=-1).astype(np.float32) / self.max,
+                                      self.target)
         if self.method == "naive":
             ink = 1.0 - np.stack(chans, axis=-1).astype(np.float32) / self.max
             c, m, y, k = ink[..., 0], ink[..., 1], ink[..., 2], ink[..., 3]
-            return np.stack([(1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)], axis=-1)
+            return reencode_from_srgb(
+                np.stack([(1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)], axis=-1), self.target)
         if self.depth == 8:
             return self._apply_pil(self._to_pil_input(chans)).astype(np.float32) / 255.0
         # 16-bit: interpolate through a LUT sampled with littleCMS
@@ -360,6 +370,35 @@ class ColorConverter:
         if self.mode == MODE_CMYK:
             x = 1.0 - x
         return self._interp(x).reshape(h, w, 3)
+
+    def source_lab(self, chans: list) -> Optional[np.ndarray]:
+        """Reference CIE Lab (D50) of the source colours according to the source
+        profile, with the same intent/BPC as the conversion. None if there is
+        no profile to measure against."""
+        if self.src_profile is None or self.mode not in (MODE_CMYK, MODE_RGB, MODE_GRAY):
+            return None
+        from PIL import Image, ImageCms
+        import io
+        if self._lab_transform is None:
+            flags = 0x2000 if self.bpc else 0
+            in_mode = {MODE_CMYK: "CMYK", MODE_RGB: "RGB", MODE_GRAY: "L"}[self.mode]
+            self._lab_transform = ImageCms.buildTransform(
+                ImageCms.ImageCmsProfile(io.BytesIO(self.src_profile)), ImageCms.createProfile("LAB"),
+                in_mode, "LAB", INTENTS.get(self.intent, 1), flags)
+        a = np.stack(chans, axis=-1)
+        if self.depth == 16:
+            a = (a.astype(np.uint32) * 255 + 32767) // 65535
+        a = np.ascontiguousarray(a, dtype=np.uint8)
+        if self.mode == MODE_CMYK:
+            a = 255 - a
+        mode = {MODE_CMYK: "CMYK", MODE_RGB: "RGB", MODE_GRAY: "L"}[self.mode]
+        if mode == "L":
+            a = a[..., 0]
+        im = Image.frombytes(mode, (a.shape[1], a.shape[0]), a.tobytes())
+        lab = np.asarray(ImageCms.applyTransform(im, self._lab_transform), np.float64)
+        ab = lab[..., 1:]
+        ab = np.where(ab > 127, ab - 256, ab)              # Pillow stores a/b as signed bytes
+        return np.concatenate([lab[..., :1] * (100 / 255), ab], -1)
 
     def to_rgb_raw(self, chans: list, dtype) -> list:
         rgb = self.to_rgb_float(chans)
@@ -394,8 +433,12 @@ def convert_to_srgb(doc: PSD, conv: ColorConverter, progress: Callable = None) -
     doc.mode = MODE_RGB
     doc.num_channels = 3
     doc.color_mode_data = b""
-    doc.set_resource(1039, srgb_profile_bytes())
+    from .colorspaces import icc_bytes
+    doc.set_resource(1039, icc_bytes(conv.target))
     return doc
+
+
+convert_to_target = convert_to_srgb
 
 
 def prepare_for_save(doc: PSD) -> PSD:

@@ -33,12 +33,28 @@ class Settings:
     source_path: Optional[str] = None                 # original file: never written to
     artboard: Optional[Artboard] = None               # export just this artboard
     artboard_transparent: bool = False                # ignore the artboard's background colour
+    target: str = "srgb"                              # colorspaces.TARGETS key
     overwrite: bool = False                           # allow replacing existing outputs (never the original)
 
 
 def make_converter(doc: PSD, s: Settings) -> ops.ColorConverter:
     return ops.ColorConverter(doc.mode, doc.depth, doc.icc_profile, s.cmyk_profile,
-                              s.intent, s.bpc, s.use_embedded)
+                              s.intent, s.bpc, s.use_embedded, s.target if s.convert else "srgb")
+
+
+def colour_tag(doc: PSD, s: Settings) -> str:
+    """Name tag of the colour space the outputs end up in (added to file names)."""
+    from .colorspaces import TARGETS
+    from .psdfile import MODE_NAMES
+    if s.convert:
+        return TARGETS[s.target].tag
+    if doc.mode == MODE_RGB and doc.icc_profile:
+        desc = ops.profile_info(doc.icc_profile)[1].lower()
+        for key, tag in (("srgb", "sRGB"), ("adobe rgb", "AdobeRGB"), ("display p3", "P3"),
+                         ("709", "Rec709"), ("prophoto", "ProPhoto")):
+            if key in desc:
+                return tag
+    return MODE_NAMES.get(doc.mode, "RGB").replace("Grayscale", "Gray")
 
 
 def edited_doc(doc: PSD, s: Settings) -> PSD:
@@ -87,10 +103,12 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
     saved = use_saved_composite(doc, s)
     result["composite_source"] = "Photoshop composite" if saved else "rebuilt from layers"
 
-    needs_convert = s.convert and (work.mode != MODE_RGB or conv.method == "icc")
+    needs_convert = s.convert and (work.mode != MODE_RGB or conv.method == "icc"
+                                   or s.target != "srgb")
     if needs_convert:
         how = f", {s.intent}{', BPC' if s.bpc else ''}" if conv.method == "icc" else ""
-        log(f"Converting to sRGB ({conv.source_desc}{how})")
+        from .colorspaces import TARGETS
+        log(f"Converting to {TARGETS[conv.target].label} ({conv.source_desc}{how})")
         ops.convert_to_srgb(work, conv, progress)
         conv_rgb = None
     else:
@@ -144,8 +162,9 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
         if s.flat_alpha:
             px = np.concatenate([px, ops.to_dtype(alpha, dtype)[..., None]], -1)
         # sRGB when converted; an unconverted RGB file keeps its own profile
+        from .colorspaces import icc_bytes
         icc = (work.icc_profile if (not needs_convert and work.mode == MODE_RGB and work.icc_profile)
-               else ops.srgb_profile_bytes())
+               else icc_bytes(s.target if needs_convert else "srgb"))
         ext = os.path.splitext(s.out_flat)[1].lower()
         if ext in (".tif", ".tiff"):
             write_tiff(s.out_flat, px, icc, doc.resolution)
@@ -181,7 +200,8 @@ def _add_background_layer(doc: PSD, rgb: tuple):
 
 
 def export_artboards(doc: PSD, base: Settings, boards: list, stem: str, want_psd: bool,
-                     flat_ext: Optional[str], log: Callable = print, progress: Callable = None) -> dict:
+                     flat_ext: Optional[str], log: Callable = print, progress: Callable = None,
+                     tag: Optional[str] = None) -> dict:
     """Export each artboard on its own, numbered in the given order:
     <stem>_01_<name>.psd / .png ..."""
     import copy
@@ -191,7 +211,7 @@ def export_artboards(doc: PSD, base: Settings, boards: list, stem: str, want_psd
         s = copy.copy(base)
         s.artboard = board
         s.crop = None
-        st = artboard_stem(stem, n, board.name, width)
+        st = artboard_stem(stem, n, board.name, width) + (f"_{tag}" if tag else "")
         s.out_psd = st + ".psd" if want_psd else None
         s.out_flat = st + flat_ext if flat_ext else None
         for p in (s.out_psd, s.out_flat):

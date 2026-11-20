@@ -22,23 +22,46 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
 * **Crop**: drag on the preview to draw the box, then drag its edges or move it. You can also type
   X/Y/W/H or pick an aspect (16:9, 1:1, 4:5, 9:16…). By default pixels outside the crop are
   deleted; untick *Delete cropped pixels* to keep them, like Photoshop does.
-* **Colour**: one checkbox, *Convert CMYK to sRGB*. It's on by default for CMYK files and
-  greyed out for anything else; RGB files are left as they are and keep their own profile. The
-  conversion uses the file's embedded profile, or the bundled generic CMYK profile if there
-  isn't one, with Photoshop's defaults (Relative Colorimetric + black point compensation).
-  Converted files get an sRGB profile embedded.
+* **Colour → Convert to**:
+  * **sRGB** (default).
+  * **Rec.709 (gamma 2.4)**: BT.1886, what a Rec.709 monitor and Flame's "Rec.709 video" use.
+  * **Rec.709 (camera OETF)**: Nuke's `rec709`.
+  * **No conversion**.
+
+  CMYK uses the file's embedded profile, or the bundled generic CMYK profile if there isn't
+  one, with Photoshop's defaults (Relative Colorimetric + black point compensation). Untagged
+  RGB is treated as sRGB, so going to Rec.709 is exact maths (same primaries, only the curve
+  changes). The outputs get a matching ICC profile embedded.
+* **Proving the conversion**:
+  * **Hover** the preview: the status bar shows the pixel's source values (e.g.
+    `CMYK 100 0 0 0 %`) and the converted ones (`sRGB 0 159 227`), plus their ΔE. You can
+    compare with Photoshop's Info panel.
+  * **Check conversion** measures every visible pixel against what the source ICC profile says
+    the colour is (CIE Lab), as **ΔE2000**. ΔE < 1 is invisible; < 2 is only visible side by side.
+    Colours the target can't show (pure CMYK cyan is outside sRGB and Rec.709) are reported
+    separately: they're clipped to the nearest colour, as Photoshop does.
+  * **Highlight pixels with ΔE > 2** hatches those areas in magenta in the preview.
+  * A broken conversion (for example inverted CMYK) shows up as ΔE in the tens to ~100.
 * **Original panel** shows the source's colour mode (RGB / CMYK / Gray / Lab), bit depth,
   embedded colour profile and its colour space.
 * **The original is protected.** Every write is checked against the source file (resolved
   paths and hard links included) and refused if it matches, from the GUI and the command line.
-* **Save to → Next to the original, auto-named** (the default) writes into the source folder
-  as `<name>_<suffix>_v1.psd` / `.png`, then `_v2`, `_v3`… The suffix defaults to `cleanup` and
-  you can edit it. The version is one more than the highest found in that folder, so nothing is
-  ever overwritten. The panel shows the next name. *Ask where to save* uses file dialogs instead.
+* **Save to**, with the colour space always at the end of the name:
+  * **Next to the original, auto-named** (default): writes into the source folder as
+    `<name>_<suffix>_v1_sRGB.png`, then `_v2`… The suffix defaults to `cleanup` and you can edit
+    it. The version is one more than the highest found in that folder, so nothing is ever
+    overwritten.
+  * **Other folder and name**: pick a folder and type a name, e.g. folder `/jobs/deliveries`,
+    name `Client Logo` → `Client_Logo_v1_Rec709.png`. It's still versioned and still never
+    overwrites.
+  * **Ask where to save each time**: file dialogs, with the tagged name pre-filled.
+
+  The tag is the colour space you chose (`sRGB`, `Rec709`, `Rec709-OETF`). With *No conversion*
+  it's the file's own space (`CMYK`, `AdobeRGB`, `RGB`…). The panel shows the next name.
 * **Artboards** (Photoshop's "pages") are listed when the file has them. Tick the ones to export,
   drag to reorder, or use *Reading order* (rows top to bottom, left to right) or *Layers order*.
   *Export artboards* writes each one as its own PSD and/or flattened file, numbered in that
-  order: `<name>_cleanup_v1_01_<Artboard>.psd`, `_02_…`. Each one is cropped to its artboard,
+  order: `<name>_cleanup_v1_01_<Artboard>_sRGB.psd`, `_02_…`. Each one is cropped to its artboard,
   keeps only its own layers, and gets the artboard background colour. In the PSD that colour is
   a bottom layer; tick *Transparent background* to skip it. Clicking an artboard outlines it in
   the preview.
@@ -88,13 +111,16 @@ PSDPrep in.psd --list
 PSDPrep in.psd --remove "Retouch*" --remove-hidden --crop 0,0,1920,1080 \
         --out-psd out.psd --out-flat out.png --depth 16
 PSDPrep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
-PSDPrep in.psd --auto both                     # -> in_cleanup_v1.psd + .png next to in.psd
-PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>.png, _02_…
+PSDPrep in.psd --auto both                     # -> in_cleanup_v1_sRGB.psd + .png next to in.psd
+PSDPrep in.psd --to rec709 --auto flat --folder /jobs/out --name "Client Logo"
+                                               # -> /jobs/out/Client_Logo_v1_Rec709.png
+PSDPrep in.psd --check --to rec709             # print the ΔE2000 conversion report
+PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>_sRGB.png, _02_…
 PSDPrep logo.ai --long-side 4000 --auto flat --artboards   # Illustrator: one PNG per artboard
 PSDPrep logo.ai --dpi 300 --out-flat logo.tif            # all artboards laid out in one image
 ```
 
-## Limits (v0.4)
+## Limits (v0.5)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.
@@ -158,6 +184,8 @@ psdprep/gui.py       PySide6 UI (falls back to PySide2)
 psdprep/cli.py       command line / entry point
 psdprep/artboards.py artboard detection / ordering
 psdprep/vector.py    Illustrator/PDF rendering (pypdfium2)
+psdprep/colorspaces.py sRGB / Rec.709 targets, ICC profiles, ΔE2000
+psdprep/check.py     conversion check and pixel probe
 psdprep/naming.py    auto names, versions, original-file guard
 psdprep/descriptor.py Photoshop descriptor parser
 psdprep/selftest.py  headless self-test (run by CI on the built app)

@@ -42,7 +42,13 @@ def main(argv=None):
     ap.add_argument("--remove-hidden", action="store_true", help="remove layers hidden in the file")
     ap.add_argument("--crop", help="x,y,w,h in pixels")
     ap.add_argument("--keep-cropped", action="store_true", help="keep pixels outside the crop")
-    ap.add_argument("--no-convert", action="store_true", help="keep the original colour mode")
+    ap.add_argument("--to", default="srgb", choices=["none", "srgb", "rec709", "rec709_oetf"],
+                    help="output colour space (default srgb; rec709 = gamma 2.4, rec709_oetf = camera curve)")
+    ap.add_argument("--no-convert", action="store_true", help="same as --to none")
+    ap.add_argument("--check", action="store_true",
+                    help="measure the colour conversion against the source profile (ΔE2000) and print it")
+    ap.add_argument("--folder", help="with --auto: write into this folder instead of next to the original")
+    ap.add_argument("--name", help="with --auto: base file name (version and colour space are added)")
     ap.add_argument("--profile", help="CMYK ICC profile when the file has none")
     ap.add_argument("--ignore-embedded", action="store_true", help="use --profile even if embedded")
     ap.add_argument("--intent", default="Relative Colorimetric", choices=list(ops.INTENTS))
@@ -72,7 +78,7 @@ def main(argv=None):
             ap.error(str(e))
     else:
         doc = read_psd(a.psd)
-    if a.list or not (a.out_psd or a.out_flat or a.auto):
+    if a.list or not (a.out_psd or a.out_flat or a.auto or a.check):
         print(f"{a.psd}: {doc.width}x{doc.height} {MODE_NAMES.get(doc.mode)} {doc.depth}-bit, "
               f"profile: {ops.profile_info(doc.icc_profile)[1] if doc.icc_profile else 'none'}")
         for node, depth in ops.walk(ops.build_tree(doc.layers)):
@@ -88,7 +94,7 @@ def main(argv=None):
             continue
         if any(fnmatch.fnmatchcase(L.name, pat) for pat in a.remove) or (a.remove_hidden and not L.visible):
             remove.add(i)
-    s = Settings(remove=remove, delete_cropped=not a.keep_cropped, convert=not a.no_convert,
+    s = Settings(remove=remove, delete_cropped=not a.keep_cropped, convert=not (a.no_convert or a.to == "none"),
                  use_embedded=not a.ignore_embedded, cmyk_profile=a.profile, intent=a.intent,
                  bpc=not a.no_bpc, flatten_source=a.source, out_psd=a.out_psd,
                  out_flat=a.out_flat, flat_depth=a.depth, flat_alpha=not a.no_alpha)
@@ -103,6 +109,13 @@ def main(argv=None):
             ap.error(f"--crop {a.crop} is outside the {doc.width}x{doc.height} image")
         s.crop = (x, y, w, h)
     s.overwrite = a.overwrite
+    s.target = a.to if a.to != "none" else "srgb"
+    if a.check:
+        from .check import conversion_check
+        from .pipeline import make_converter
+        print(conversion_check(doc, make_converter(doc, s), 1).message)
+        if not (a.out_psd or a.out_flat or a.auto):
+            return 0
     if s.cmyk_profile is None:
         found = ops.find_cmyk_profiles()
         if found:
@@ -113,15 +126,23 @@ def main(argv=None):
             ap.error("refusing to overwrite the input file")
     ext = "." + a.format
     if a.auto:
-        stem = naming.auto_stem(a.psd, a.suffix)
+        from .pipeline import colour_tag
+        if a.folder:
+            if not os.path.isdir(a.folder):
+                ap.error(f"--folder {a.folder} doesn't exist")
+            stem = naming.custom_stem(a.folder, a.name or naming.base_name(a.psd, a.suffix))
+        else:
+            stem = naming.auto_stem(a.psd, a.suffix)
+        tag = colour_tag(doc, s)
         want_psd, want_flat = a.auto in ("psd", "both"), a.auto in ("flat", "both")
         if a.artboards:
             boards = find_artboards(doc)
             if not boards:
                 ap.error("this file has no artboards")
             boards = boards if a.layer_order else sort_by_position(boards)
-            export_artboards(doc, s, boards, stem, want_psd, ext if want_flat else None)
+            export_artboards(doc, s, boards, stem, want_psd, ext if want_flat else None, tag=tag)
             return 0
+        stem = naming.with_tag(stem, tag)
         s.out_psd = stem + ".psd" if want_psd else None
         s.out_flat = stem + ext if want_flat else None
     try:

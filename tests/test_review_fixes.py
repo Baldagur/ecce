@@ -249,6 +249,64 @@ def test_illustrator_pdf():
             assert "PDF compatib" in str(e)
 
 
+def test_delta_e_2000_reference():
+    from psdprep.colorspaces import delta_e_2000
+    # Sharma, Wu & Dalal (2005) test data
+    for a, b, ref in (((50, 2.6772, -79.7751), (50, 0, -82.7485), 2.0425),
+                      ((50, 2.5, 0), (73, 25, -18), 27.1492),
+                      ((60.2574, -34.0099, 36.2677), (60.4626, -34.1751, 39.4387), 1.2644)):
+        assert abs(float(delta_e_2000(np.array(a, float), np.array(b, float))) - ref) < 1e-3
+
+
+def test_rec709_profiles_match_maths():
+    from PIL import Image, ImageCms
+    from psdprep.colorspaces import pil_profile, reencode_from_srgb
+    g = np.arange(256, dtype=np.uint8)
+    ramp = np.stack([g, g, g], -1)[None]
+    for t in ("rec709", "rec709_oetf"):
+        tr = ImageCms.buildTransform(ImageCms.createProfile("sRGB"), pil_profile(t), "RGB", "RGB", 1)
+        out = np.asarray(ImageCms.applyTransform(Image.fromarray(ramp), tr))[0, :, 0].astype(float)
+        ref = np.rint(reencode_from_srgb(g / 255.0, t) * 255)
+        assert np.abs(out - ref).max() <= 1, (t, np.abs(out - ref).max())
+    # untagged RGB -> Rec.709 is exact maths: mid grey 128 -> gamma 2.4 code
+    conv = ops.ColorConverter(MODE_RGB, 8, None, target="rec709")
+    v = conv.to_rgb_float([np.full((1, 1), 128, np.uint8)] * 3)[0, 0, 0] * 255
+    assert abs(v - 255 * (((128 / 255 + 0.055) / 1.055) ** 2.4) ** (1 / 2.4)) < 0.01
+
+
+def test_check_catches_a_wrong_conversion():
+    from psdprep import check, fixtures
+    from psdprep.colorspaces import build_icc
+    # a CMYK profile isn't available everywhere: measure an RGB file whose
+    # embedded profile is our own Rec.709 one (RGB->sRGB through lcms)
+    d = rgb_doc()
+    d.set_resource(1039, build_icc("rec709"))
+    d.layers = [solid("colours", (200, 120, 30))]
+    conv = ops.ColorConverter(MODE_RGB, 8, d.icc_profile, target="srgb")
+    good = check.conversion_check(d, conv, 1)
+    assert good.ok and good.stats["p95"] < 1.0, good.message
+    conv.to_rgb_float = lambda chans: np.stack([1 - c.astype(np.float32) / 255 for c in chans[:3]], -1)
+    bad = check.conversion_check(d, conv, 1)
+    assert not bad.ok and bad.stats["p95"] > 10, bad.message
+
+
+def test_colour_tags_and_custom_names():
+    from psdprep import naming
+    from psdprep.pipeline import Settings, colour_tag
+    d = rgb_doc()
+    assert colour_tag(d, Settings(convert=True, target="rec709")) == "Rec709"
+    assert colour_tag(d, Settings(convert=True, target="rec709_oetf")) == "Rec709-OETF"
+    assert colour_tag(d, Settings(convert=False)) == "RGB"
+    from psdprep.fixtures import make_doc
+    assert colour_tag(make_doc(8), Settings(convert=False)) == "CMYK"
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "client_logo_v3_sRGB.png"), "w").close()
+        stem = naming.custom_stem(tmp, "client logo")
+        assert os.path.basename(stem) == "client_logo_v4"
+        assert os.path.basename(naming.custom_stem(tmp, "client_logo_v1")) == "client_logo_v4"
+        assert naming.with_tag(stem, "Rec709").endswith("client_logo_v4_Rec709")
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

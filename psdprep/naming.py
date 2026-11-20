@@ -48,6 +48,18 @@ def auto_stem(source: str, suffix: str) -> str:
     return os.path.join(folder, f"{base}_v{next_version(folder, base)}")
 
 
+def custom_stem(folder: str, name: str) -> str:
+    """<folder>/<name>_v<N>: a chosen folder and name, still versioned."""
+    base = re.sub(r"[^\w\-.]+", "_", (name or "").strip()).strip("_.") or "output"
+    base = re.sub(r"_v\d+$", "", base, flags=re.IGNORECASE)   # the version is added for you
+    return os.path.join(folder, f"{base}_v{next_version(folder, base)}")
+
+
+def with_tag(stem: str, tag: str) -> str:
+    """Colour-space tag at the end of the name: logo_cleanup_v1 -> logo_cleanup_v1_sRGB"""
+    return f"{stem}_{tag}" if tag else stem
+
+
 def artboard_stem(stem: str, number: int, name: str, width: int = 2) -> str:
     return f"{stem}_{number:0{width}d}_{safe_name(name)}"
 
