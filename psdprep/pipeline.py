@@ -43,18 +43,25 @@ def make_converter(doc: PSD, s: Settings) -> ops.ColorConverter:
                               s.intent, s.bpc, s.use_embedded, s.target if s.convert else "srgb")
 
 
-def colour_tag(doc: PSD, s: Settings) -> str:
-    """Name tag of the colour space the outputs end up in (added to file names)."""
+def colour_tag(doc: PSD, s: Settings, flat: bool = False) -> str:
+    """Name tag of the colour space a written file is really in.
+    flat=True: the flattened PNG/TIFF (always RGB: an unconverted CMYK/Gray/Lab
+    file is written as sRGB)."""
     from .colorspaces import TARGETS
     from .psdfile import MODE_NAMES
     if s.convert:
         return TARGETS[s.target].tag
-    if doc.mode == MODE_RGB and doc.icc_profile:
-        desc = ops.profile_info(doc.icc_profile)[1].lower()
-        for key, tag in (("srgb", "sRGB"), ("adobe rgb", "AdobeRGB"), ("display p3", "P3"),
-                         ("709", "Rec709"), ("prophoto", "ProPhoto")):
-            if key in desc:
-                return tag
+    if doc.mode == MODE_RGB:
+        if doc.icc_profile:
+            desc = ops.profile_info(doc.icc_profile)[1].lower()
+            for key, tag in (("oetf", "Rec709-OETF"), ("709", "Rec709"), ("1886", "Rec709"),
+                             ("srgb", "sRGB"), ("adobe rgb", "AdobeRGB"), ("display p3", "P3"),
+                             ("prophoto", "ProPhoto")):
+                if key in desc:
+                    return tag
+        return "RGB"
+    if flat:
+        return "sRGB"
     return MODE_NAMES.get(doc.mode, "RGB").replace("Grayscale", "Gray")
 
 
@@ -203,7 +210,7 @@ def _add_background_layer(doc: PSD, rgb: tuple):
 
 def export_artboards(doc: PSD, base: Settings, boards: list, stem: str, want_psd: bool,
                      flat_ext: Optional[str], log: Callable = print, progress: Callable = None,
-                     tag: Optional[str] = None) -> dict:
+                     tag: Optional[str] = None, tag_flat: Optional[str] = None) -> dict:
     """Export each artboard on its own, numbered in the given order:
     <stem>_01_<name>.psd / .png ..."""
     import copy
@@ -213,9 +220,10 @@ def export_artboards(doc: PSD, base: Settings, boards: list, stem: str, want_psd
         s = copy.copy(base)
         s.artboard = board
         s.crop = None
-        st = artboard_stem(stem, n, board.name, width) + (f"_{tag}" if tag else "")
-        s.out_psd = st + ".psd" if want_psd else None
-        s.out_flat = st + flat_ext if flat_ext else None
+        st = artboard_stem(stem, n, board.name, width)
+        tf = tag_flat if tag_flat is not None else tag
+        s.out_psd = st + (f"_{tag}" if tag else "") + ".psd" if want_psd else None
+        s.out_flat = st + (f"_{tf}" if tf else "") + flat_ext if flat_ext else None
         for p in (s.out_psd, s.out_flat):
             if p and os.path.exists(p):
                 raise FileExistsError(f"{p} already exists")

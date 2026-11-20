@@ -18,7 +18,8 @@ from . import descriptor
 from .psdfile import MODE_RGB, PSD, SECTION_DIVIDER, SECTION_OPEN, Layer
 
 VECTOR_EXTS = (".ai", ".pdf")
-MAX_PIXELS = 400_000_000          # per page; ~20000 x 20000
+MAX_PIXELS = 250_000_000          # per page; ~15800 x 15800
+MAX_CANVAS = 300_000_000          # all artboards together (~5 GB of float buffers)
 
 
 class VectorError(Exception):
@@ -146,8 +147,9 @@ def load_vector(path: str, dpi: Optional[float] = None, long_side: Optional[int]
     widths = [sum(r.shape[1] for _, r in row) + gap * (len(row) - 1) for row in rows]
     heights = [max(r.shape[0] for _, r in row) for row in rows]
     W, H = max(widths), sum(heights) + gap * (len(rows) - 1)
-    if W * H > 2_000_000_000:
-        raise VectorError("All artboards together are too large at this resolution.")
+    if W * H > MAX_CANVAS:
+        raise VectorError(f"All artboards together would be {W} × {H} px (about "
+                          f"{W * H * 16 / 1e9:.0f} GB of working memory). Lower the resolution.")
 
     doc = PSD(width=W, height=H, depth=8, mode=MODE_RGB, num_channels=3)
     doc.source_kind = "vector"

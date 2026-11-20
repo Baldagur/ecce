@@ -113,16 +113,16 @@ def main(argv=None):
     s.overwrite = a.overwrite
     s.nuke_psd = a.nuke
     s.target = a.to if a.to != "none" else "srgb"
+    if s.cmyk_profile is None:
+        found = ops.find_cmyk_profiles()
+        if found:
+            s.cmyk_profile = found[0][0]
     if a.check:
         from .check import conversion_check
         from .pipeline import make_converter
         print(conversion_check(doc, make_converter(doc, s), 1).message)
         if not (a.out_psd or a.out_flat or a.auto):
             return 0
-    if s.cmyk_profile is None:
-        found = ops.find_cmyk_profiles()
-        if found:
-            s.cmyk_profile = found[0][0]
     s.source_path = a.psd
     for p in (a.out_psd, a.out_flat):
         if p and naming.is_same_file(p, a.psd):
@@ -136,18 +136,18 @@ def main(argv=None):
             stem = naming.custom_stem(a.folder, a.name or naming.base_name(a.psd, a.suffix))
         else:
             stem = naming.auto_stem(a.psd, a.suffix)
-        tag = colour_tag(doc, s)
+        tag, tag_flat = colour_tag(doc, s), colour_tag(doc, s, flat=True)
         want_psd, want_flat = a.auto in ("psd", "both"), a.auto in ("flat", "both")
         if a.artboards:
             boards = find_artboards(doc)
             if not boards:
                 ap.error("this file has no artboards")
             boards = boards if a.layer_order else sort_by_position(boards)
-            export_artboards(doc, s, boards, stem, want_psd, ext if want_flat else None, tag=tag)
+            export_artboards(doc, s, boards, stem, want_psd, ext if want_flat else None,
+                             tag=tag, tag_flat=tag_flat)
             return 0
-        stem = naming.with_tag(stem, tag)
-        s.out_psd = stem + ".psd" if want_psd else None
-        s.out_flat = stem + ext if want_flat else None
+        s.out_psd = naming.with_tag(stem, tag) + ".psd" if want_psd else None
+        s.out_flat = naming.with_tag(stem, tag_flat) + ext if want_flat else None
     try:
         process(doc, s)
     except FileExistsError as e:

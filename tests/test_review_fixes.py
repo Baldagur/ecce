@@ -285,9 +285,16 @@ def test_check_catches_a_wrong_conversion():
     conv = ops.ColorConverter(MODE_RGB, 8, d.icc_profile, target="srgb")
     good = check.conversion_check(d, conv, 1)
     assert good.ok and good.stats["p95"] < 1.0, good.message
+    real = ops.ColorConverter.to_rgb_float
     conv.to_rgb_float = lambda chans: np.stack([1 - c.astype(np.float32) / 255 for c in chans[:3]], -1)
     bad = check.conversion_check(d, conv, 1)
     assert not bad.ok and bad.stats["p95"] > 10, bad.message
+    # subtler: too bright by 1.5x and clipped (values pinned at 255 must not hide it)
+    conv.to_rgb_float = lambda chans: np.clip(real(conv, chans) * 1.5, 0, 1)
+    d.layers = [solid("colours", (200, 120, 30)), solid("white", (255, 255, 255), rect=(0, 0, 2, 2)),
+                solid("pure", (230, 20, 20), rect=(2, 0, 4, 2))]
+    bad2 = check.conversion_check(d, conv, 1)
+    assert not bad2.ok, bad2.message
 
 
 def test_colour_tags_and_custom_names():
@@ -386,6 +393,101 @@ def test_nuke_psd_through_pipeline():
         names = [L.name for L in read_psd(b).layers]
         assert all(n.isascii() for n in names) and "Cyan circle e" in names, names
         assert all(L.left >= 0 and L.right <= 320 for L in read_psd(b).layers)
+
+
+def _nuke_err(d):
+    want_rgb, want_a = composite(d)
+    got_rgb, got_a = nuke_breakout(roundtrip(ops.nuke_friendly(d)))
+    return max(np.abs(got_a - want_a).max(),
+               np.abs(got_rgb * got_a[..., None] - want_rgb * want_a[..., None]).max())
+
+
+def test_nuke_clipping_unit_with_base_opacity_and_blend():
+    for kw in ({"opacity": 128}, {"blend_mode": "mul "}):
+        d = rgb_doc()
+        d.layers = [solid("bg", (200, 200, 200)), solid("base", (0, 0, 255), rect=(0, 2, 4, 6), **kw),
+                    solid("clipped", (255, 0, 0), clipping=1)]
+        assert _nuke_err(d) < 0.02, kw
+
+
+def test_nuke_clip_to_group():
+    d = rgb_doc()
+    g = Layer(name="G", section=SECTION_OPEN, section_blend="pass")
+    d.layers = [Layer(name="</Layer group>", section=SECTION_DIVIDER), solid("2px", rect=(0, 0, H, 2)), g,
+                solid("texture", (0, 255, 0), clipping=1)]
+    assert _nuke_err(d) < 0.02
+
+
+def test_nuke_feathered_group_mask():
+    d = rgb_doc()
+    g = Layer(name="G", section=SECTION_OPEN, section_blend="pass")
+    g.mask = Mask(0, 0, H, W, 0, 0, np.full((H, W), 128, np.uint8))
+    d.layers = [Layer(name="</Layer group>", section=SECTION_DIVIDER), solid("a", (255, 0, 0)),
+                solid("b", (0, 0, 255)), g]
+    assert _nuke_err(d) < 0.02
+
+
+def test_nuke_unique_names_and_off_canvas():
+    d = rgb_doc()
+    d.layers = [solid("foo"), solid("foo", (1, 2, 3)), solid("foo 2", (4, 5, 6)),
+                solid("gone", rect=(0, 20, 4, 24))]
+    names = [L.name for L in ops.nuke_friendly(d).layers]
+    assert len(set(names)) == len(names) == 3, names
+
+
+def test_rec709_icc_keeps_primaries():
+    from PIL import Image, ImageCms
+    from psdprep.colorspaces import pil_profile
+    px = np.array([[[0, 255, 0], [0, 0, 255], [255, 0, 0]]], np.uint8)
+    for t in ("rec709", "rec709_oetf"):
+        tr = ImageCms.buildTransform(ImageCms.createProfile("sRGB"), pil_profile(t), "RGB", "RGB", 1)
+        assert np.asarray(ImageCms.applyTransform(Image.fromarray(px), tr)).tolist() == px.tolist(), t
+
+
+def test_flat_tag_and_oetf_tag():
+    from psdprep.colorspaces import build_icc
+    from psdprep.fixtures import make_doc
+    from psdprep.pipeline import Settings, colour_tag
+    cmyk = make_doc(8)
+    assert colour_tag(cmyk, Settings(convert=False)) == "CMYK"
+    assert colour_tag(cmyk, Settings(convert=False), flat=True) == "sRGB"
+    d = rgb_doc()
+    d.set_resource(1039, build_icc("rec709_oetf"))
+    assert colour_tag(d, Settings(convert=False)) == "Rec709-OETF"
+    d.set_resource(1039, build_icc("rec709"))
+    assert colour_tag(d, Settings(convert=False), flat=True) == "Rec709"
+
+
+def test_effective_hidden_follows_ui():
+    d = rgb_doc()
+    g = Layer(name="G", section=SECTION_OPEN, section_blend="pass")
+    child = solid("child")
+    hid = solid("hidden in file")
+    hid.visible = False
+    clip = solid("clipped", clipping=1)
+    d.layers = [Layer(name="</Layer group>", section=SECTION_DIVIDER), child, g, hid, clip]
+    gi = d.layers.index(g)
+    h = ops.effective_hidden(d, remove={gi}, visibility={d.layers.index(hid): True})
+    assert id(child) in h and id(g) in h          # removed group hides its child
+    assert id(hid) not in h and id(clip) not in h  # eye turned on in the UI
+    h2 = ops.effective_hidden(d)
+    assert id(hid) in h2 and id(clip) in h2       # as saved: hidden base hides its clipped layer
+
+
+def test_vector_canvas_cap():
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:
+        return
+    from psdprep import vector
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "big.pdf")
+        vector.make_test_pdf(p)
+        try:
+            vector.load_vector(p, dpi=9000)
+            raise AssertionError("huge render allowed")
+        except vector.VectorError as e:
+            assert "too large" in str(e) or "Lower the resolution" in str(e)
 
 
 if __name__ == "__main__":

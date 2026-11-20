@@ -86,6 +86,21 @@ def rgb_to_lab(rgb: np.ndarray, target: str = "srgb") -> np.ndarray:
     return np.stack([L, a, b], -1)
 
 
+def lab_to_linear(lab: np.ndarray) -> np.ndarray:
+    """CIE Lab (D50) -> linear RGB with sRGB/Rec.709 primaries, NOT clipped
+    (values outside 0..1 mean the colour is outside the gamut)."""
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    fy = (L + 16) / 116
+    fx = fy + a / 500
+    fz = fy - b / 200
+    e, k = 216 / 24389, 24389 / 27
+
+    def finv(f):
+        return np.where(f ** 3 > e, f ** 3, (116 * f - 16) / k)
+    xyz = np.stack([finv(fx), np.where(L > k * e, fy ** 3, L / k), finv(fz)], -1) * D50
+    return xyz @ np.linalg.inv(RGB2XYZ_D50).T
+
+
 def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
     L1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]
     L2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]
@@ -148,17 +163,38 @@ def _curve(decode: Callable, gamma: Optional[float]) -> bytes:
     return b"curv\0\0\0\0" + struct.pack(">I", n) + vals.tobytes()
 
 
+def _srgb_colorants() -> np.ndarray:
+    """rXYZ/gXYZ/bXYZ columns exactly as lcms's built-in sRGB profile has them,
+    so sRGB -> Rec.709 never shifts primaries (pure green stays 0,255,0)."""
+    try:
+        from PIL import ImageCms
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        n = struct.unpack(">I", icc[128:132])[0]
+        tags = {}
+        for i in range(n):
+            sig, off, size = struct.unpack(">4sII", icc[132 + 12 * i:144 + 12 * i])
+            tags[sig] = icc[off:off + size]
+        cols = []
+        for sig in (b"rXYZ", b"gXYZ", b"bXYZ"):
+            v = struct.unpack(">3i", tags[sig][8:20])
+            cols.append([x / 65536 for x in v])
+        return np.array(cols).T
+    except Exception:
+        return RGB2XYZ_D50
+
+
 def build_icc(target: str) -> bytes:
     """ICC v2 matrix/TRC display profile for a target (lcms and Photoshop read it)."""
     t = TARGETS[target]
-    gamma = 2.4 if target == "rec709" else None
+    gamma = 2.4 if target == "rec709" else None   # pure gamma: lcms inverts it analytically
     names = {"srgb": "sRGB (PSD Prep)", "rec709": "Rec.709 gamma 2.4 (BT.1886)",
              "rec709_oetf": "Rec.709 (ITU-R BT.709 OETF)"}
     trc = _curve(t.decode, gamma)
+    cols = _srgb_colorants()
     tags = [(b"desc", _desc(names[target])), (b"cprt", _text("No copyright, use freely")),
             (b"wtpt", _xyz(*D50)),
-            (b"rXYZ", _xyz(*RGB2XYZ_D50[:, 0])), (b"gXYZ", _xyz(*RGB2XYZ_D50[:, 1])),
-            (b"bXYZ", _xyz(*RGB2XYZ_D50[:, 2])),
+            (b"rXYZ", _xyz(*cols[:, 0])), (b"gXYZ", _xyz(*cols[:, 1])),
+            (b"bXYZ", _xyz(*cols[:, 2])),
             (b"rTRC", trc), (b"gTRC", trc), (b"bTRC", trc)]
     off = 128 + 4 + 12 * len(tags)
     table, body, seen = b"", b"", {}

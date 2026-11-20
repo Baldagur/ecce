@@ -170,14 +170,16 @@ def profile_info(data: bytes) -> tuple:
 def find_cmyk_profiles() -> list:
     """List of (path, description) of CMYK ICC profiles found on this machine.
     Also looks in a 'profiles' folder next to the app."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    dirs = list(CMYK_PROFILE_DIRS) + [os.path.join(here, "profiles"),
-                                       os.path.join(os.path.dirname(here), "profiles")]
     import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    # the app's own profiles first, so every workstation converts the same way
+    dirs = []
+    if getattr(sys, "frozen", False) and getattr(sys, "executable", None):
+        dirs.append(os.path.join(os.path.dirname(sys.executable), "profiles"))
     if getattr(sys, "_MEIPASS", None):
         dirs.append(os.path.join(sys._MEIPASS, "profiles"))
-    if getattr(sys, "executable", None):
-        dirs.append(os.path.join(os.path.dirname(sys.executable), "profiles"))
+    dirs += [os.path.join(os.path.dirname(here), "profiles"), os.path.join(here, "profiles")]
+    dirs += list(CMYK_PROFILE_DIRS)
     seen, out = set(), []
     for d in dirs:
         for folder in glob.glob(d):
@@ -738,6 +740,35 @@ def clone(doc: PSD) -> PSD:
     return new
 
 
+def effective_hidden(doc: PSD, remove: set = (), visibility: dict = None) -> set:
+    """ids of layers that don't show, given UI removals/eye toggles (by index):
+    removed or hidden layers, everything inside them, and clipped layers of a
+    hidden base."""
+    visibility = visibility or {}
+    index_of = {id(L): i for i, L in enumerate(doc.layers)}
+    out = set()
+
+    def shown(L):
+        i = index_of[id(L)]
+        return i not in remove and visibility.get(i, L.visible)
+
+    def walk(nodes, parent_hidden):
+        base_hidden = False
+        for n in nodes:
+            L = n.layer
+            h = parent_hidden or not shown(L)
+            if L.clipping:
+                h = h or base_hidden
+            else:
+                base_hidden = h
+            if h:
+                out.add(id(L))
+            if n.is_group:
+                walk(n.children, h)
+    walk(build_tree(doc.layers), False)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Nuke-friendly layered PSD
 # ---------------------------------------------------------------------------
@@ -763,8 +794,12 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
 
     def raster_group(node) -> Optional[Layer]:
         """The group's visible contents merged into one layer (isolated)."""
+        return raster_nodes(node.children, node.layer.name)
+
+    def raster_nodes(nodes, name) -> Optional[Layer]:
+        """Nodes (bottom -> top) composited on transparency into one layer."""
         sub = copy.copy(doc)
-        sub.layers = flatten_tree(node.children)
+        sub.layers = flatten_tree(nodes)
 
         def raw(L, src):
             if not all(c in L.channels for c in range(nc)):
@@ -777,8 +812,20 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
         t, b, l, r = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         ch = {c: np.clip(np.rint(col[t:b, l:r, c] * maxv), 0, maxv).astype(doc.dtype) for c in range(nc)}
         ch[-1] = np.clip(np.rint(a[t:b, l:r] * maxv), 0, maxv).astype(doc.dtype)
-        return Layer(name=node.layer.name, top=int(t), left=int(l), bottom=int(b), right=int(r),
+        return Layer(name=name, top=int(t), left=int(l), bottom=int(b), right=int(r),
                      channels=ch)
+
+    def binary_mask(m: Mask) -> bool:
+        if m is None or m.disabled or m.data is None:
+            return True
+        if m.default_color not in (0, 255):
+            return False
+        return not m.data.size or bool(np.isin(m.data, (0, int(maxv))).all())
+
+    def has_blend_children(nodes) -> bool:
+        return any(n.layer.visible and (n.layer.blend() not in ("norm", "pass")
+                                        or (n.is_group and has_blend_children(n.children)))
+                   for n in nodes)
 
     def mask_on(rect, m: Mask) -> Optional[np.ndarray]:
         """Mask values (0..1) over rect=(top,left,bottom,right)."""
@@ -835,32 +882,60 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
         nl.section = 0
         out_layers.append(nl)
 
+    def merged_unit(nodes, base: Layer, factor, gmasks, label):
+        """Base + its clipped layers (or a group) merged into one layer that
+        takes the base's opacity and blend mode, as Photoshop applies them."""
+        base_copy = copy.copy(base)
+        base_copy.opacity = 255
+        base_copy.clipping = 0
+        if base.is_group:
+            base_copy.section_blend = "pass"
+        else:
+            base_copy.blend_mode = "norm"
+        first = Node(base_copy, nodes[0].children, nodes[0].divider)
+        merged = raster_nodes([first] + list(nodes[1:]), base.name)
+        if merged is None:
+            return
+        mode = base.blend()
+        merged.opacity = base.opacity
+        merged.blend_mode = "norm" if mode == "pass" else mode
+        emit(merged, factor, gmasks, None)
+        rastered.append(label)
+
     def walk_nodes(nodes, factor, gmasks):
-        base, base_visible = None, True
-        for n in nodes:
-            L = n.layer
-            if not L.clipping:
-                base, base_visible = (None if n.is_group else L), L.visible
-            if not L.visible or (L.clipping and not base_visible):
+        i = 0
+        while i < len(nodes):
+            base_node = nodes[i]
+            j = i + 1
+            while j < len(nodes) and nodes[j].layer.clipping:
+                j += 1
+            clipped = [n for n in nodes[i + 1:j] if n.layer.visible]
+            i = j
+            L = base_node.layer
+            if not L.visible:
+                continue                       # a hidden base hides its clipped layers too
+            gm = gmasks + ([L.mask] if (base_node.is_group and L.mask is not None
+                                        and not L.mask.disabled) else [])
+            simple_base = (not base_node.is_group and L.opacity == 255 and L.blend() == "norm"
+                           and not any(c.is_group for c in clipped))
+            if clipped and not simple_base:
+                # base opacity/blend applies to the whole clipping unit, and a
+                # clip to a group needs the group's shape: merge the unit
+                merged_unit([base_node] + clipped, L, factor, gmasks,
+                            f"{L.name} (+{len(clipped)} clipped)")
                 continue
-            if n.is_group:
+            if base_node.is_group:
                 mode = L.blend()
-                gm = gmasks + ([L.mask] if (L.mask is not None and not L.mask.disabled) else [])
-                if mode == "pass" and L.opacity == 255:
-                    walk_nodes(n.children, factor, gm)          # dissolves exactly
+                if mode == "pass" and L.opacity == 255 and binary_mask(L.mask):
+                    walk_nodes(base_node.children, factor, gm)     # dissolves exactly
                 else:
-                    # group opacity / blend act on the merged group: merge it
-                    merged = raster_group(n)
-                    if merged is not None:
-                        merged.opacity = L.opacity
-                        merged.blend_mode = "norm" if mode == "pass" else mode
-                        merged.mask = None
-                        emit(merged, factor, gm, None)
-                        rastered.append(L.name)
+                    if mode == "pass" and has_blend_children(base_node.children):
+                        notes.add(f"blend modes inside '{L.name}' (they now blend within the group only)")
+                    merged_unit([base_node], L, factor, gmasks, L.name)
                 continue
-            if L.clipping and base is None:
-                notes.add(f"clipping of '{L.name}' to a group")
-            emit(L, factor, gmasks, base if L.clipping else None)
+            emit(L, factor, gmasks, None)
+            for c in clipped:
+                emit(c.layer, factor, gmasks, L)
 
     walk_nodes(build_tree(doc.layers), 1.0, [])
     # Nuke-specific clean-up
@@ -871,10 +946,12 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
         # Nuke stops breaking out at the first non-ASCII layer name (Foundry bug 535819)
         ascii_name = unicodedata.normalize("NFKD", L.name).encode("ascii", "ignore").decode()
         ascii_name = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in ascii_name).strip() or "layer"
-        n = seen.get(ascii_name, 0)
-        seen[ascii_name] = n + 1
-        if n:
-            ascii_name = f"{ascii_name} {n + 1}"          # unique names -> unique Nuke channels
+        if ascii_name in seen:                            # unique names -> unique Nuke channels
+            k = 2
+            while f"{ascii_name} {k}" in seen:
+                k += 1
+            ascii_name = f"{ascii_name} {k}"
+        seen[ascii_name] = True
         if ascii_name != L.name:
             renamed.append(f"{L.name} → {ascii_name}")
             L.name = ascii_name
@@ -886,15 +963,18 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
                           for k, v in L.channels.items()}
             L.top, L.left, L.bottom, L.right = t, l, b, r
     out_layers = [L for L in out_layers if L.bottom > L.top and L.right > L.left
-                  and 0 <= L.top and L.bottom <= doc.height]
+                  and 0 <= L.top and L.bottom <= doc.height
+                  and 0 <= L.left and L.right <= doc.width]
     new = copy.copy(doc)
     new.layers = out_layers
     if log and renamed:
         log("Nuke-friendly PSD: renamed for Nuke: " + ", ".join(renamed[:8]))
     if log and len(out_layers) > 100:
         log(f"Nuke-friendly PSD: {len(out_layers)} layers — Nuke's Breakout Layers stops at 100.")
+    if rastered and doc.mode != MODE_RGB:
+        notes.add("exact blend modes in merged layers of a non-RGB file (convert to RGB for Nuke)")
     if log and rastered:
-        log("Nuke-friendly PSD: merged into one layer (group opacity/blend): " + ", ".join(rastered))
+        log("Nuke-friendly PSD: merged into one layer so Nuke matches: " + ", ".join(rastered))
     if log and notes:
         log("Nuke-friendly PSD: can't keep " + ", ".join(sorted(notes)))
     return new

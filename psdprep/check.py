@@ -29,16 +29,22 @@ class CheckResult:
         return self.message
 
 
+GAMUT_TOL = 0.02        # linear-light tolerance (8-bit Lab reference quantisation)
+
+
 def _de_for(conv: ops.ColorConverter, chans: list, with_gamut: bool = False):
-    """Delta E per pixel; with_gamut also returns where the target had to clip
-    (a channel pinned at 0 or 255 and a visible difference)."""
+    """Delta E per pixel; with_gamut also returns which SOURCE colours lie
+    outside the target gamut (decided from the source colour itself, so a
+    broken conversion can't hide its errors as 'out of gamut')."""
+    from .colorspaces import lab_to_linear
     ref = conv.source_lab(chans)
     out = conv.to_rgb_float(chans)
     de = delta_e_2000(ref, rgb_to_lab(out.astype(np.float64), conv.target)).astype(np.float32)
     if not with_gamut:
         return de
-    edge = ((out <= 0.5 / 255) | (out >= 1 - 0.5 / 255)).any(axis=-1)
-    return de, edge & (de >= THRESHOLD)
+    lin = lab_to_linear(ref)
+    outside = ((lin < -GAMUT_TOL) | (lin > 1 + GAMUT_TOL)).any(axis=-1)
+    return de, outside
 
 
 def conversion_check(doc: PSD, conv: ops.ColorConverter, scale: int = 1,
@@ -54,13 +60,15 @@ def conversion_check(doc: PSD, conv: ops.ColorConverter, scale: int = 1,
         return CheckResult(True, f"Untagged {'gray' if doc.mode == MODE_GRAY else 'RGB'} is "
                                  f"treated as sRGB: the conversion to {target} is exact maths "
                                  f"(same primaries, only the curve changes).")
-    comp = ops.Compositor(doc, lambda L, s: None, scale, hidden or set())
+    comp = ops.Compositor(doc, lambda L, s: None, scale, set())
     de_map = np.full((comp.H, comp.W), np.nan, np.float32)
     values, clipped = [], []
     nc = doc.color_channels
+    # hidden: ids that don't show (ops.effective_hidden); default: as saved
+    if hidden is None:
+        hidden = ops.effective_hidden(doc)
     layers = [L for L in doc.layers if not (L.is_group or L.is_divider)
-              and L.visible and id(L) not in (hidden or set())
-              and all(c in L.channels for c in range(nc))]
+              and id(L) not in hidden and all(c in L.channels for c in range(nc))]
     for L in layers:
         p = comp._place(L.top, L.left, L.bottom, L.right)
         if p is None:
@@ -89,6 +97,10 @@ def conversion_check(doc: PSD, conv: ops.ColorConverter, scale: int = 1,
         return CheckResult(False, "Nothing visible to check.")
     out_g = np.concatenate(clipped)
     inside = v[~out_g]
+    if inside.size == 0:
+        return CheckResult(False, f"Every measured colour is outside the {target} gamut, so there "
+                                  f"is nothing exact to compare (max ΔE {float(v.max()):.1f}).",
+                           {"pixels": int(v.size), "out_of_gamut": 1.0, "ok": False}, de_map)
     stats = {"pixels": int(v.size), "out_of_gamut": float(out_g.mean()),
              "median": float(np.median(inside)) if inside.size else 0.0,
              "p95": float(np.percentile(inside, 95)) if inside.size else 0.0,
@@ -106,8 +118,8 @@ def conversion_check(doc: PSD, conv: ops.ColorConverter, scale: int = 1,
            f"{stats['p95']:.2f}, max {stats['max']:.2f}. {verdict}.")
     if stats["out_of_gamut"] > 0:
         msg += (f"\n{stats['out_of_gamut'] * 100:.1f}% of pixels are outside the {target} gamut "
-                f"(e.g. pure cyan) and were clipped to the nearest colour (up to ΔE "
-                f"{stats['max_all']:.1f}); Photoshop clips them the same way.")
+                f"(e.g. pure cyan): no {target} value can show them, so they're clipped to the "
+                f"nearest colour (up to ΔE {stats['max_all']:.1f}), as Photoshop does.")
     stats["ok"] = stats["p95"] < 2
     return CheckResult(stats["ok"], msg, stats, de_map)
 
@@ -117,8 +129,10 @@ def probe(doc: PSD, conv: ops.ColorConverter, x: int, y: int, hidden: set = None
     if not (0 <= x < doc.width and 0 <= y < doc.height):
         return None
     nc = doc.color_channels
+    if hidden is None:
+        hidden = ops.effective_hidden(doc)
     for L in reversed(doc.layers):
-        if L.is_group or L.is_divider or not L.visible or id(L) in (hidden or set()):
+        if L.is_group or L.is_divider or id(L) in hidden:
             continue
         if not (L.left <= x < L.right and L.top <= y < L.bottom):
             continue

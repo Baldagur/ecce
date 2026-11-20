@@ -28,8 +28,9 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   * **Rec.709 (camera OETF)**: Nuke's `rec709`.
   * **No conversion**.
 
-  CMYK uses the file's embedded profile, or the bundled generic CMYK profile if there isn't
-  one, with Photoshop's defaults (Relative Colorimetric + black point compensation). Untagged
+  CMYK uses the file's embedded profile. If there isn't one, it uses the profile bundled with
+  the app (searched before any system profiles, so every workstation matches); the Original panel
+  shows which one, with Photoshop's defaults (Relative Colorimetric + black point compensation). Untagged
   RGB is treated as sRGB, so going to Rec.709 is exact maths (same primaries, only the curve
   changes). The outputs get a matching ICC profile embedded.
 * **Proving the conversion**:
@@ -51,8 +52,9 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   opacity and mask defaults, and it stops at the first layer with a non-ASCII name. With this
   on, the saved PSD is baked so Nuke rebuilds exactly what you see:
   * hidden layers are left out;
-  * groups are dissolved, and a group with its own opacity or blend mode becomes one merged
-    layer;
+  * groups are dissolved. A group with its own opacity, blend mode or a soft (feathered) mask
+    becomes one merged layer. So does a clipping stack whose base isn't Normal at 100%, or that
+    is clipped to a group. That's the only way Nuke's per-layer merge can match;
   * masks, fill and clipping are baked into each layer's alpha;
   * names are made ASCII and unique (`Cyan circé` → `Cyan circe`);
   * layers are trimmed to the canvas.
@@ -135,7 +137,7 @@ PSDPrep logo.ai --long-side 4000 --auto flat --artboards   # Illustrator: one PN
 PSDPrep logo.ai --dpi 300 --out-flat logo.tif            # all artboards laid out in one image
 ```
 
-## Limits (v0.6)
+## Limits (v0.7)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.

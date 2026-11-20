@@ -486,6 +486,8 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow(self.lbl_check)
         rv.addWidget(g)
         self.de_map = None
+        self._conv_key = self._conv = None
+        self._probe_hidden_key = self._probe_hidden = None
         # Fixed conversion settings (Photoshop's defaults): the file's embedded
         # profile, else the bundled generic CMYK profile; relative colorimetric + BPC.
         found = ops.find_cmyk_profiles()
@@ -703,6 +705,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _loaded(self, path, doc):
         self.doc, self.path = doc, path
+        self._conv_key = None
+        self._probe_hidden_key = None
         self.rgb_cache = {}
         longest = max(doc.width, doc.height)
         self.scale = max(1, math.ceil(longest / PREVIEW_MAX))
@@ -807,9 +811,13 @@ class MainWindow(QtWidgets.QMainWindow):
         o["size"].setText(f"{d.width} × {d.height} px")
         o["mode"].setText(f"<b>{MODE_NAMES.get(d.mode, d.mode)}</b>")
         o["depth"].setText(f"{d.depth}-bit")
+        fallback = ""
+        if not prof and d.mode == MODE_CMYK:
+            fallback = (" → using " + ops.profile_info(open(self.cmyk_profile, "rb").read())[1]
+                        if self.cmyk_profile else " → simple formula (no CMYK profile found)")
         o["profile"].setText(f"<b>{pdesc}</b>" if prof else
                              "<span style='color:#e0a030'>none embedded</span>"
-                             + (" (assumed sRGB)" if d.mode == MODE_RGB else ""))
+                             + (" (assumed sRGB)" if d.mode == MODE_RGB else fallback))
         o["space"].setText(space_name or "—")
         o["res"].setText(f"{res:g} dpi" if res else "—")
         o["layers"].setText(", ".join(f"{v} {k}" for k, v in kinds.items()) if kinds else "none")
@@ -985,6 +993,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _colour_changed(self, *a):
         self.rgb_cache = {}
+        self._conv_key = None
         if self.cmb_target.currentData():
             self.settings.setValue("target", self.cmb_target.currentData())
         self.de_map = None
@@ -996,11 +1005,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_next_name()
         self.schedule_preview()
 
+    def _converter(self, s):
+        """Converters are cached: building one (and its 16-bit LUT) is slow."""
+        key = (id(self.doc), s.convert, s.target, s.cmyk_profile)
+        if self._conv_key != key:
+            self._conv_key, self._conv = key, make_converter(self.doc, s)
+        return self._conv
+
     def _display_converter(self):
         """Converter for what the preview shows: the chosen target, or sRGB
         display of an unconverted file."""
         s = self._settings()
-        conv = make_converter(self.doc, s)
+        conv = self._converter(s)
         if self.doc.mode == MODE_RGB and not s.convert:
             return None
         return conv
@@ -1012,9 +1028,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not s.convert:
             self.lbl_check.setText("Choose a colour space in 'Convert to' first.")
             return
-        hidden = {id(self.doc.layers[i]) for i in s.remove}
-        hidden |= {id(self.doc.layers[i]) for i, v in s.visibility.items() if not v}
-        conv = make_converter(self.doc, s)
+        hidden = ops.effective_hidden(self.doc, s.remove, s.visibility)
+        conv = self._converter(s)
         self._run(_run_check, self.doc, conv, self.scale, hidden, on_done=self._checked)
 
     def _checked(self, res):
@@ -1030,9 +1045,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.doc or self.thread is not None:
             return
         s = self._settings()
-        conv = make_converter(self.doc, s)
-        hidden = {id(self.doc.layers[i]) for i in s.remove}
-        hidden |= {id(self.doc.layers[i]) for i, v in s.visibility.items() if not v}
+        conv = self._converter(s)
+        if self._probe_hidden_key != (frozenset(s.remove), tuple(sorted(s.visibility.items()))):
+            self._probe_hidden_key = (frozenset(s.remove), tuple(sorted(s.visibility.items())))
+            self._probe_hidden = ops.effective_hidden(self.doc, s.remove, s.visibility)
+        hidden = self._probe_hidden
         try:
             r = check_mod.probe(self.doc, conv, x, y, hidden)
         except Exception:
@@ -1143,14 +1160,13 @@ class MainWindow(QtWidgets.QMainWindow):
         fmt = self.cmb_fmt.currentText()
         ext = ".png" if fmt == "PNG" else ".tif"
         self._remember_save_options()
-        tag = colour_tag(self.doc, s)
+        tag, tag_flat = colour_tag(self.doc, s), colour_tag(self.doc, s, flat=True)
         if not self.rad_ask.isChecked():
             stem = self._versioned_stem()
             if stem is None:
                 return
-            stem = naming.with_tag(stem, tag)
-            s.out_psd = stem + ".psd" if psd else None
-            s.out_flat = stem + ext if flat else None
+            s.out_psd = naming.with_tag(stem, tag) + ".psd" if psd else None
+            s.out_flat = naming.with_tag(stem, tag_flat) + ext if flat else None
             for p in (s.out_psd, s.out_flat):
                 if p and os.path.exists(p):          # can't happen, but never overwrite
                     QtWidgets.QMessageBox.warning(self, "PSD Prep", f"{p} already exists.")
@@ -1158,7 +1174,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run(process, self.doc, s, on_done=self._exported)
             return
         outdir = self.settings.value("out_dir", os.path.dirname(self.path))
-        stem = naming.with_tag(naming.custom_stem(outdir, naming.base_name(self.path, self.txt_suffix.text())), tag)
+        plain = naming.custom_stem(outdir, naming.base_name(self.path, self.txt_suffix.text()))
+        stem = naming.with_tag(plain, tag)
         if psd:
             p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PSD", stem + ".psd",
                                                          "Photoshop (*.psd)")
@@ -1174,10 +1191,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._ok_to_replace(p, chosen):
                 return
             s.out_psd = p
-            stem = os.path.splitext(p)[0]
+            plain = os.path.splitext(p)[0]
+            if plain.endswith("_" + tag):
+                plain = plain[:-len(tag) - 1]
         if flat:
             p, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Export flattened image", stem + ext,
+                self, "Export flattened image", naming.with_tag(plain, tag_flat) + ext,
                 "PNG (*.png);;TIFF (*.tif *.tiff)" if fmt == "PNG" else "TIFF (*.tif *.tiff);;PNG (*.png)")
             if not p:
                 return
@@ -1254,9 +1273,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if stem is None:
             self.lbl_next.setText("Pick an output folder.")
             return
-        stem = naming.with_tag(stem, colour_tag(self.doc, self._settings()))
+        st = self._settings()
+        tp, tf = colour_tag(self.doc, st), colour_tag(self.doc, st, flat=True)
         ext = ".png" if self.cmb_fmt.currentText() == "PNG" else ".tif"
-        self.lbl_next.setText(f"Next: {os.path.basename(stem)}.psd / {ext}\nin {os.path.dirname(stem)}")
+        names = (f"{os.path.basename(stem)}_{tp}.psd / {ext}" if tp == tf else
+                 f"{os.path.basename(stem)}_{tp}.psd / _{tf}{ext}")
+        self.lbl_next.setText(f"Next: {names}\nin {os.path.dirname(stem)}")
 
     def export_boards(self):
         if not self.doc:
@@ -1287,7 +1309,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s.source_path = self.path
         s.artboard_transparent = self.chk_board_transp.isChecked()
         self._run(export_artboards, self.doc, s, boards, stem, want_psd, ext, on_done=self._exported,
-                  tag=colour_tag(self.doc, s))
+                  tag=colour_tag(self.doc, s), tag_flat=colour_tag(self.doc, s, flat=True))
 
     # -- threading ------------------------------------------------------------
     def _run(self, fn, *args, on_done=None, **kwargs):
