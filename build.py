@@ -2,7 +2,7 @@
 machines that run it. Run on the OS you ship (no cross-builds):
 
     python3 -m venv build-venv
-    build-venv/bin/pip install pyinstaller pyside6-essentials pillow numpy pypdfium2
+    build-venv/bin/pip install -r requirements-build.txt
     build-venv/bin/python build.py
 
 Linux: build on the OLDEST distro you support (Rocky 8 -> runs on Rocky 8 and 9).

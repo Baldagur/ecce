@@ -38,7 +38,10 @@ def write_png(path: str, pixels: np.ndarray, icc: Optional[bytes] = None,
     if dpi:
         ppm = int(round(dpi / 0.0254))
         out.append(_png_chunk(b"pHYs", struct.pack(">IIB", ppm, ppm, 1)))
-    out.append(_png_chunk(b"IDAT", zlib.compress(data.tobytes(), level)))
+    comp = zlib.compress(data.tobytes(), level)
+    step = 1 << 30                          # chunk lengths are 4 bytes: split big images
+    for i in range(0, max(1, len(comp)), step):
+        out.append(_png_chunk(b"IDAT", comp[i:i + step]))
     out.append(_png_chunk(b"IEND", b""))
     with open(path, "wb") as f:
         f.write(b"".join(out))
@@ -76,6 +79,9 @@ def write_tiff(path: str, pixels: np.ndarray, icc: Optional[bytes] = None,
         entries.append((tag, typ, len(values), b))
 
     n_strips = len(strips)
+    if sum(len(x) for x in strips) > (1 << 32) - (1 << 26):
+        raise ValueError("This TIFF would be over 4 GB, which baseline TIFF can't hold. "
+                         "Export PNG instead, use 8-bit, or crop.")
     add(256, 4, [w])
     add(257, 4, [h])
     add(258, 3, [bits] * c)

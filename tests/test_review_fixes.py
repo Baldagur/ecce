@@ -490,6 +490,61 @@ def test_vector_canvas_cap():
             assert "too large" in str(e) or "Lower the resolution" in str(e)
 
 
+def test_pass_group_opacity_over_transparency():
+    d = rgb_doc()
+    g = Layer(name="G", section=SECTION_OPEN, section_blend="pass", opacity=128)
+    d.layers = [Layer(name="</Layer group>", section=SECTION_DIVIDER), solid("x", (200, 100, 50)), g]
+    rgb, a = composite(d)
+    assert np.allclose(rgb[0, 0] * 255, (200, 100, 50), atol=0.6) and abs(a[0, 0] - 128 / 255) < 0.01
+
+
+def test_lab_files_convert_correctly():
+    from psdprep.psdfile import MODE_LAB
+    for depth, scale in ((8, 1), (16, 257)):
+        conv = ops.ColorConverter(MODE_LAB, depth, None)
+        dt = np.uint8 if depth == 8 else np.uint16
+        grey = conv.to_rgb_float([np.full((1, 1), v * scale, dt) for v in (128, 128, 128)])[0, 0] * 255
+        assert np.allclose(grey, 119, atol=2), (depth, grey)          # L=50 neutral -> ~119
+        red = conv.to_rgb_float([np.full((1, 1), v * scale, dt) for v in (136, 208, 195)])[0, 0] * 255
+        assert red[0] > 240 and red[1] < 20 and red[2] < 20, (depth, red)
+
+
+def test_nuke_channel_safe_unique_names():
+    import re
+    d = rgb_doc()
+    d.layers = [solid("Logo 2"), solid("Logo_2", (1, 1, 1)), solid("a.b", (2, 2, 2)), solid("a b", (3, 3, 3))]
+    names = [L.name for L in ops.nuke_friendly(d).layers]
+    keys = [re.sub(r"[^A-Za-z0-9_]", "_", n).lower() for n in names]
+    assert len(set(keys)) == 4, names
+
+
+def test_compositor_shown_override_leaves_doc_untouched():
+    d = rgb_doc()
+    hid = solid("hidden in file")
+    hid.visible = False
+    d.layers = [hid]
+    a = ops.Compositor(d, ops.default_get_rgb(d), shown={id(hid)}).run()[1]
+    assert a.max() == 1 and not hid.visible
+
+
+def test_artboard_background_in_rec709():
+    from psdprep import artboards
+    from psdprep.colorspaces import reencode_from_srgb
+    from psdprep.fixtures import make_artboard_doc
+    from psdprep.pipeline import Settings, export_artboards
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = make_artboard_doc()
+        doc.layers[-3:] = []                 # drop Banner; keep Square (white) and Small (red)
+        boards = artboards.find_artboards(doc)
+        export_artboards(doc, Settings(target="rec709"), boards, os.path.join(tmp, "b_v1"), False,
+                         ".png", log=lambda *a: None, tag="Rec709")
+        small = [f for f in os.listdir(tmp) if "Small" in f][0]
+        px = np.asarray(Image.open(os.path.join(tmp, small)))[2, 2]
+        want = np.rint(reencode_from_srgb(np.array([1.0, 0, 0]), "rec709") * 255)
+        assert np.allclose(px[:3], want, atol=1) and px[3] == 255, px
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

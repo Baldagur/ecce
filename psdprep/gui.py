@@ -1070,6 +1070,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_preview(self, fit=False):
         if not self.doc:
             return
+        if self.thread is not None:          # a save/load is running: draw when it's done
+            self._preview_pending = True
+            return
         doc, s = self.doc, self._settings()
         conv = self._display_converter()
         try:
@@ -1079,17 +1082,11 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 hidden = {id(doc.layers[i]) for i in s.remove}
                 hidden |= {id(doc.layers[i]) for i, v in s.visibility.items() if not v}
-                # visibility override: layers hidden in file but ticked visible
-                force_vis = {i for i, v in s.visibility.items() if v and not doc.layers[i].visible}
-                saved = {i: doc.layers[i].flags for i in force_vis}
-                for i in force_vis:
-                    doc.layers[i].visible = True
-                try:
-                    comp = ops.Compositor(doc, self._cached_rgb(conv), self.scale, hidden)
-                    rgb, alpha = comp.run()
-                finally:
-                    for i, fl in saved.items():
-                        doc.layers[i].flags = fl
+                # layers hidden in the file but ticked visible: passed to the
+                # compositor (the document itself is never touched)
+                shown = {id(doc.layers[i]) for i, v in s.visibility.items() if v}
+                comp = ops.Compositor(doc, self._cached_rgb(conv), self.scale, hidden, shown=shown)
+                rgb, alpha = comp.run()
                 src = "rebuilt from layers"
                 if comp.unsupported:
                     src += " (drawn as Normal: " + ", ".join(sorted(comp.unsupported)) + ")"
@@ -1315,6 +1312,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run(self, fn, *args, on_done=None, **kwargs):
         if self.thread is not None:
             return
+        self._preview_timer.stop()
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.setEnabled(False)
@@ -1347,6 +1345,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _finish(self, res):
         on_done, self._on_done = self._on_done, None
         self._cleanup()
+        if getattr(self, "_preview_pending", False):
+            self._preview_pending = False
+            self.schedule_preview()
         if on_done:
             try:
                 on_done(res)

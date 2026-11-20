@@ -50,5 +50,5 @@ jobs:
             --title "PSD Prep (latest build)" \
             --notes "Built $STAMP from the newest commit. The window title shows the same build stamp.
 
-          Linux (Rocky 8/9): PSDPrep-linux-x86_64.tar.gz -> tar -xzf it, then run PSDPrep (or double-click 'PSD Prep.desktop')." \
+          Linux (Rocky 8/9): PSDPrep-linux-x86_64.tar.gz -> tar -xzf it, then run PSDPrep/PSDPrep once (or 'Run PSD Prep.sh'): it then appears in the Activities menu; 'Install shortcut.sh' adds a Desktop icon." \
             artifacts/PSDPrep-linux-x86_64/PSDPrep-linux-x86_64.tar.gz

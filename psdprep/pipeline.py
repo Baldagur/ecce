@@ -142,9 +142,12 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
 
     bg = None if (s.artboard is None or s.artboard_transparent) else s.artboard.background
     if bg is not None:
-        rgb = rgb * alpha[..., None] + np.asarray(bg, np.float32) * (1 - alpha[..., None])
+        from .colorspaces import reencode_from_srgb
+        bg_enc = reencode_from_srgb(np.asarray(bg, np.float32)[None, None],
+                                    s.target if needs_convert else "srgb")[0, 0]
+        rgb = rgb * alpha[..., None] + bg_enc * (1 - alpha[..., None])
         alpha = np.ones_like(alpha)
-        _add_background_layer(work, bg)
+        _add_background_layer(work, tuple(float(v) for v in bg_enc) if work.mode == MODE_RGB else bg)
 
     if s.out_psd:
         ops.prepare_for_save(work)

@@ -137,7 +137,7 @@ PSDPrep logo.ai --long-side 4000 --auto flat --artboards   # Illustrator: one PN
 PSDPrep logo.ai --dpi 300 --out-flat logo.tif            # all artboards laid out in one image
 ```
 
-## Limits (v0.7)
+## Limits (v0.8)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.
@@ -187,7 +187,7 @@ the build includes Ghostscript's generic `default_cmyk.icc`. To ship your own pr
 FOGRA39, SWOP…), drop the `.icc` files into `profiles/` before building, or later into
 `PSDPrep/profiles/` next to the app. The first one found is used for untagged CMYK files.
 
-From source (on a machine that has the libraries): `python3 app_main.py`. Tests:
+From source (Python 3.11+ with the pinned libraries in `requirements.txt`; Rocky 8's own `python3` is 3.6 and too old): `python3.11 app_main.py`. Tests:
 `python3 tests/test_roundtrip.py`. Self-test: `PSDPrep selftest`.
 
 ## Layout

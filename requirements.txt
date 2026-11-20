@@ -1,4 +1,7 @@
-numpy
-Pillow
-PySide6-Essentials
-pypdfium2
+# Pinned: the offline Rocky bundle is built from exactly these versions.
+# Update deliberately (bump, push, check the CI self-test), never implicitly.
+numpy==2.4.6
+Pillow==13.0.0
+PySide6-Essentials==6.9.3
+shiboken6==6.9.3
+pypdfium2==5.15.2

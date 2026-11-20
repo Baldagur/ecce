@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import glob
 import os
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -298,7 +299,13 @@ class ColorConverter:
         a = np.stack(chans, axis=-1)
         if self.mode == MODE_CMYK:
             a = 255 - a  # PSD stores CMYK inverted
-        return np.ascontiguousarray(a, dtype=np.uint8)
+        a = np.ascontiguousarray(a, dtype=np.uint8)
+        if self.mode == MODE_LAB:
+            # PSD stores a/b with +128 offset (128 = neutral); Pillow's LAB mode
+            # uses signed bytes (0 = neutral): flip the top bit
+            a = a.copy()
+            a[..., 1:] ^= 0x80
+        return a
 
     def _apply_pil(self, arr: np.ndarray) -> np.ndarray:
         from PIL import Image, ImageCms
@@ -309,13 +316,15 @@ class ColorConverter:
 
     def _build_lut(self):
         n_in = 4 if self.mode == MODE_CMYK else 3
-        N = 18 if n_in == 4 else 52          # 255 / (N-1) is an integer
+        N = 18 if n_in == 4 else 86          # 255 / (N-1) is an integer
         nodes = np.arange(N, dtype=np.int32) * (255 // (N - 1))
         grids = np.meshgrid(*([nodes] * n_in), indexing="ij")
         pts = np.stack([g.reshape(-1) for g in grids], axis=-1).astype(np.uint8)
         side = int(np.ceil(np.sqrt(pts.shape[0])))
         padded = np.zeros((side * side, n_in), np.uint8)
         padded[:pts.shape[0]] = pts
+        if self.mode == MODE_LAB:
+            padded[:, 1:] ^= 0x80        # nodes are PSD Lab values; Pillow wants signed a/b
         rgb = self._apply_pil(padded.reshape(side, side, n_in)).reshape(-1, 3)[:pts.shape[0]]
         self._lut = (N, n_in, rgb.astype(np.float32) / 255.0)
 
@@ -507,8 +516,9 @@ class Compositor:
     """
 
     def __init__(self, doc: PSD, get_rgb: Callable, scale: int = 1, hidden: set = None,
-                 channels: int = 3):
+                 channels: int = 3, shown: set = None):
         self.nch = channels
+        self.shown = shown or set()          # ids forced visible (UI eye on)
         self.doc = doc
         self.get_rgb = get_rgb
         self.s = max(1, int(scale))
@@ -577,7 +587,7 @@ class Compositor:
         return co.astype(np.float32), ao.astype(np.float32)
 
     def _visible(self, L: Layer) -> bool:
-        return L.visible and id(L) not in self.hidden
+        return (L.visible or id(L) in self.shown) and id(L) not in self.hidden
 
     def _mode(self, L: Layer) -> str:
         mode = L.blend()
@@ -600,9 +610,15 @@ class Compositor:
                 if f is None and op == 1:
                     rgb[:], alpha[:] = work_rgb, work_a
                 else:
-                    f2 = f if f is not None else np.full(alpha.shape, op, np.float32)
-                    rgb[:] = rgb + (work_rgb - rgb) * f2[..., None]
-                    alpha[:] = alpha + (work_a - alpha) * f2
+                    # mix the group result with the backdrop by opacity x mask,
+                    # premultiplied (straight colour over transparency would darken)
+                    f2 = (f if f is not None else np.full(alpha.shape, op, np.float32))[..., None]
+                    a3, w3 = alpha[..., None], work_a[..., None]
+                    a_new = a3 + (w3 - a3) * f2
+                    pre = rgb * a3 + (work_rgb * w3 - rgb * a3) * f2
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        rgb[:] = np.where(a_new > 0, pre / np.maximum(a_new, 1e-12), 0)
+                    alpha[:] = a_new[..., 0]
                 return
             g_rgb, g_a = np.zeros_like(rgb), np.zeros_like(alpha)
             self._composite_nodes(n.children, g_rgb, g_a)
@@ -946,12 +962,16 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
         # Nuke stops breaking out at the first non-ASCII layer name (Foundry bug 535819)
         ascii_name = unicodedata.normalize("NFKD", L.name).encode("ascii", "ignore").decode()
         ascii_name = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in ascii_name).strip() or "layer"
-        if ascii_name in seen:                            # unique names -> unique Nuke channels
+        # Nuke turns anything but letters/digits/_ into '_' for channel names,
+        # so "Logo 2" and "Logo_2" would clash: de-duplicate on that form
+        def key(n):
+            return re.sub(r"[^A-Za-z0-9_]", "_", n).lower()
+        if key(ascii_name) in seen:
             k = 2
-            while f"{ascii_name} {k}" in seen:
+            while key(f"{ascii_name} {k}") in seen:
                 k += 1
             ascii_name = f"{ascii_name} {k}"
-        seen[ascii_name] = True
+        seen[key(ascii_name)] = True
         if ascii_name != L.name:
             renamed.append(f"{L.name} → {ascii_name}")
             L.name = ascii_name
@@ -971,6 +991,11 @@ def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
         log("Nuke-friendly PSD: renamed for Nuke: " + ", ".join(renamed[:8]))
     if log and len(out_layers) > 100:
         log(f"Nuke-friendly PSD: {len(out_layers)} layers — Nuke's Breakout Layers stops at 100.")
+    odd = sorted({BLEND_NAMES.get(L.blend_mode, L.blend_mode) for L in out_layers
+                  if L.blend_mode not in BLENDS})
+    if odd:
+        notes.add("blend modes PSD Prep can't preview (" + ", ".join(odd)
+                  + "): Nuke's PSDMerge may show them differently from the preview")
     if rastered and doc.mode != MODE_RGB:
         notes.add("exact blend modes in merged layers of a non-RGB file (convert to RGB for Nuke)")
     if log and rastered:
