@@ -324,14 +324,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.setColumnWidth(2, 90)
         self.tree.itemChanged.connect(self._item_changed)
         lv.addWidget(self.tree, 1)
-        row = QtWidgets.QHBoxLayout()
-        b1 = QtWidgets.QPushButton("Remove hidden")
-        b1.clicked.connect(self.remove_hidden)
-        b2 = QtWidgets.QPushButton("Keep all")
-        b2.clicked.connect(self.keep_all)
-        row.addWidget(b1)
-        row.addWidget(b2)
-        lv.addLayout(row)
+        grid = QtWidgets.QGridLayout()
+        for label, fn, tip, (row, col, span) in (
+                ("Show all", self.show_all, "Turn every layer's eye on", (0, 0, 1)),
+                ("Hide all", self.hide_all, "Turn every layer's eye off", (0, 1, 1)),
+                ("Reset to original", self.reset_layers,
+                 "Back to how the file was saved: same visible/hidden layers, nothing removed",
+                 (1, 0, 2)),
+                ("Remove hidden", self.remove_hidden, "Untick every layer whose eye is off", (2, 0, 1)),
+                ("Keep all", self.keep_all, "Tick every layer again (nothing removed)", (2, 1, 1))):
+            btn = QtWidgets.QPushButton(label)
+            btn.setToolTip(tip)
+            btn.clicked.connect(fn)
+            grid.addWidget(btn, row, col, 1, span)
+        lv.addLayout(grid)
         split.addWidget(left)
 
         # preview
@@ -379,34 +385,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # colour
         g = QtWidgets.QGroupBox("Colour")
         f = QtWidgets.QFormLayout(g)
-        self.chk_convert = QtWidgets.QCheckBox("Convert to sRGB")
+        self.chk_convert = QtWidgets.QCheckBox("Convert CMYK to sRGB")
         self.chk_convert.setChecked(True)
+        self.chk_convert.setEnabled(False)
         f.addRow(self.chk_convert)
-        self.chk_embedded = QtWidgets.QCheckBox("Use embedded profile")
-        self.chk_embedded.setChecked(True)
-        f.addRow(self.chk_embedded)
-        prow = QtWidgets.QHBoxLayout()
-        self.cmb_profile = QtWidgets.QComboBox()
-        self.cmb_profile.setMinimumWidth(160)
-        bb = QtWidgets.QToolButton()
-        bb.setText("…")
-        bb.clicked.connect(self.browse_profile)
-        prow.addWidget(self.cmb_profile, 1)
-        prow.addWidget(bb)
-        f.addRow("CMYK profile", prow)
-        self.cmb_intent = QtWidgets.QComboBox()
-        self.cmb_intent.addItems(list(ops.INTENTS))
-        self.cmb_intent.setCurrentText(self.settings.value("intent", "Relative Colorimetric"))
-        f.addRow("Intent", self.cmb_intent)
-        self.chk_bpc = QtWidgets.QCheckBox("Black point compensation")
-        self.chk_bpc.setChecked(True)
-        f.addRow(self.chk_bpc)
-        self.lbl_src = QtWidgets.QLabel("")
-        self.lbl_src.setWordWrap(True)
-        self.lbl_src.setStyleSheet("color: #999;")
-        f.addRow(self.lbl_src)
         rv.addWidget(g)
-        self._fill_profiles()
+        # Fixed conversion settings (Photoshop's defaults): the file's embedded
+        # profile, else the bundled generic CMYK profile; relative colorimetric + BPC.
+        found = ops.find_cmyk_profiles()
+        self.cmyk_profile = found[0][0] if found else None
 
         # crop
         g = QtWidgets.QGroupBox("Crop")
@@ -522,10 +509,7 @@ class MainWindow(QtWidgets.QMainWindow):
         split.setSizes([330, 820, 350])
         self.boards = []
 
-        for w in (self.chk_convert, self.chk_embedded, self.chk_bpc):
-            w.toggled.connect(self._colour_changed)
-        self.cmb_profile.currentIndexChanged.connect(self._colour_changed)
-        self.cmb_intent.currentIndexChanged.connect(self._colour_changed)
+        self.chk_convert.toggled.connect(self._colour_changed)
         self.cmb_source.currentIndexChanged.connect(self.schedule_preview)
 
     def _set_enabled(self, on):
@@ -534,44 +518,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def log(self, msg):
         self.logbox.appendPlainText(msg)
-
-    # -- profiles -----------------------------------------------------
-    def _fill_profiles(self):
-        self.cmb_profile.blockSignals(True)
-        self.cmb_profile.clear()
-        self.cmb_profile.addItem("(none – simple formula)", None)
-        found = ops.find_cmyk_profiles()
-        extra = self.settings.value("extra_profiles", []) or []
-        if isinstance(extra, str):
-            extra = [extra]
-        for p in extra:
-            if os.path.isfile(p) and p not in [f[0] for f in found]:
-                with open(p, "rb") as fh:
-                    found.append((p, ops.profile_info(fh.read())[1] or os.path.basename(p)))
-        for p, desc in found:
-            self.cmb_profile.addItem(desc, p)
-            self.cmb_profile.setItemData(self.cmb_profile.count() - 1, p, E(Qt, "ItemDataRole", "ToolTipRole"))
-        last = self.settings.value("cmyk_profile", "")
-        idx = self.cmb_profile.findData(last) if last else -1
-        if idx < 0 and self.cmb_profile.count() > 1:
-            idx = 1
-        self.cmb_profile.setCurrentIndex(max(0, idx))
-        self.cmb_profile.blockSignals(False)
-
-    def browse_profile(self):
-        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "CMYK ICC profile", "",
-                                                     "ICC profiles (*.icc *.icm);;All files (*)")
-        if not p:
-            return
-        extra = self.settings.value("extra_profiles", []) or []
-        if isinstance(extra, str):
-            extra = [extra]
-        if p not in extra:
-            extra.append(p)
-        self.settings.setValue("extra_profiles", extra)
-        self.settings.setValue("cmyk_profile", p)
-        self._fill_profiles()
-        self._colour_changed()
 
     # -- open ---------------------------------------------------------
     def open_dialog(self):
@@ -611,7 +557,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fill_tree()
         self._update_info()
         self._set_enabled(True)
-        self.chk_convert.setChecked(doc.mode != MODE_RGB or bool(doc.icc_profile))
+        is_cmyk = doc.mode == MODE_CMYK
+        self.chk_convert.blockSignals(True)
+        self.chk_convert.setEnabled(is_cmyk)
+        self.chk_convert.setChecked(is_cmyk)
+        self.chk_convert.blockSignals(False)
         self._colour_changed()
         self.boards = ab_mod.find_artboards(doc)
         self._fill_boards(self.boards)
@@ -762,6 +712,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_children_enabled(it, it.checkState(0) == CHECKED)
         self.schedule_preview()
 
+    def _set_all_eyes(self, state_for):
+        self._building = True
+        for idx, it in self.items.items():
+            it.setCheckState(1, state_for(idx))
+        self._building = False
+        self.schedule_preview()
+
+    def show_all(self):
+        self._set_all_eyes(lambda i: CHECKED)
+
+    def hide_all(self):
+        self._set_all_eyes(lambda i: UNCHECKED)
+
+    def reset_layers(self):
+        """Back to the file as saved: original eyes, nothing removed."""
+        self._building = True
+        for idx, it in self.items.items():
+            it.setCheckState(0, CHECKED)
+            it.setDisabled(False)
+            it.setCheckState(1, CHECKED if self.doc.layers[idx].visible else UNCHECKED)
+        self._building = False
+        self.schedule_preview()
+
     def keep_all(self):
         self._building = True
         for it in self.items.values():
@@ -818,23 +791,22 @@ class MainWindow(QtWidgets.QMainWindow):
         depth = {0: None, 1: 8, 2: 16}[self.cmb_depth.currentIndex()]
         return Settings(
             remove=self._removed(), visibility=self._visibility(), crop=self.view.crop,
-            delete_cropped=self.chk_delete.isChecked(), convert=self.chk_convert.isChecked(),
-            use_embedded=self.chk_embedded.isChecked(), cmyk_profile=self.cmb_profile.currentData(),
-            intent=self.cmb_intent.currentText(), bpc=self.chk_bpc.isChecked(),
+            delete_cropped=self.chk_delete.isChecked(),
+            convert=self.chk_convert.isEnabled() and self.chk_convert.isChecked(),
+            use_embedded=True, cmyk_profile=self.cmyk_profile,
+            intent="Relative Colorimetric", bpc=True,
             flatten_source=["auto", "layers", "composite"][self.cmb_source.currentIndex()],
             flat_depth=depth, flat_alpha=self.chk_alpha.isChecked())
 
     def _colour_changed(self, *a):
-        self.settings.setValue("intent", self.cmb_intent.currentText())
-        if self.cmb_profile.currentData():
-            self.settings.setValue("cmyk_profile", self.cmb_profile.currentData())
         self.rgb_cache = {}
         if self.doc:
-            conv = make_converter(self.doc, self._settings())
-            txt = f"Source: {conv.source_desc}"
-            if self.doc.mode == MODE_CMYK and conv.method == "naive":
-                txt += " — pick a CMYK profile for accurate colour"
-            self.lbl_src.setText(txt)
+            if self.doc.mode == MODE_CMYK:
+                conv = make_converter(self.doc, self._settings())
+                self.chk_convert.setToolTip(f"Uses {conv.source_desc}")
+            else:
+                self.chk_convert.setToolTip("Only CMYK files are converted; this file is "
+                                            f"{MODE_NAMES.get(self.doc.mode)} and stays as it is.")
         self.schedule_preview()
 
     def schedule_preview(self, *a):
@@ -846,7 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         doc, s = self.doc, self._settings()
         conv = make_converter(doc, s)
-        if doc.mode == MODE_RGB and not (s.convert and conv.method == "icc"):
+        if doc.mode == MODE_RGB:
             conv = None
         try:
             if use_saved_composite(doc, s):

@@ -12,14 +12,18 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
 ```
 
 * **Layers panel**: untick a layer to remove it. Removing a group removes everything in it.
-  The eye column toggles visibility. **Remove hidden** unticks every hidden layer.
+  The eye column toggles visibility. **Show all** / **Hide all** turn every eye on or off.
+  **Reset to original** puts the layers back exactly as the file was saved: the same layers
+  visible and hidden, nothing removed. **Remove hidden** unticks every hidden layer, and
+  **Keep all** ticks everything again.
 * **Crop**: drag on the preview to draw the box, then drag its edges or move it. You can also type
   X/Y/W/H or pick an aspect (16:9, 1:1, 4:5, 9:16…). By default pixels outside the crop are
   deleted; untick *Delete cropped pixels* to keep them, like Photoshop does.
-* **Colour**: *Convert to sRGB* uses the embedded profile first. If a CMYK file has no profile,
-  it uses the profile chosen in the *CMYK profile* menu. Intent and BPC default to Photoshop's
-  defaults (Relative Colorimetric + black point compensation). The output PSD gets an sRGB
-  profile embedded.
+* **Colour**: one checkbox, *Convert CMYK to sRGB*. It's on by default for CMYK files and
+  greyed out for anything else; RGB files are left as they are and keep their own profile. The
+  conversion uses the file's embedded profile, or the bundled generic CMYK profile if there
+  isn't one, with Photoshop's defaults (Relative Colorimetric + black point compensation).
+  Converted files get an sRGB profile embedded.
 * **Original panel** shows the source's colour mode (RGB / CMYK / Gray / Lab), bit depth,
   embedded colour profile and its colour space.
 * **The original is protected.** Every write is checked against the source file (resolved
@@ -111,7 +115,7 @@ Builds run on Rocky 8 and 9. The window title shows the build date and commit.
 **CMYK profiles:** files with an embedded profile always use their own. For untagged CMYK files,
 the build includes Ghostscript's generic `default_cmyk.icc`. To ship your own profiles (Coated
 FOGRA39, SWOP…), drop the `.icc` files into `profiles/` before building, or later into
-`PSDPrep/profiles/` next to the app. You can also pick one with the **…** button.
+`PSDPrep/profiles/` next to the app. The first one found is used for untagged CMYK files.
 
 From source (on a machine that has the libraries): `python3 app_main.py`. Tests:
 `python3 tests/test_roundtrip.py`. Self-test: `PSDPrep selftest`.

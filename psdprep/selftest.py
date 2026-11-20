@@ -92,6 +92,15 @@ def _gui(tmp):
     app.processEvents()
     assert len(w.items) == 6, f"tree has {len(w.items)} items"
     assert w.view.pix.pixmap().width() > 0, "empty preview"
+    hidden_in_file = {i for i, L in enumerate(w.doc.layers) if not L.visible and not L.is_divider}
+    w.show_all()
+    assert all(v for v in w._visibility().values())
+    w.hide_all()
+    assert not any(w._visibility().values())
+    w.items[next(iter(w.items))].setCheckState(0, gui.UNCHECKED)
+    w.reset_layers()
+    assert {i for i, v in w._visibility().items() if not v} == hidden_in_file
+    assert not w._removed()
     w.remove_hidden()
     removed = {w.doc.layers[i].name for i in w._removed()}
     assert removed == {"Hidden"}, removed

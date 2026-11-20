@@ -143,7 +143,9 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
         px = ops.to_dtype(rgb, dtype)
         if s.flat_alpha:
             px = np.concatenate([px, ops.to_dtype(alpha, dtype)[..., None]], -1)
-        icc = ops.srgb_profile_bytes()
+        # sRGB when converted; an unconverted RGB file keeps its own profile
+        icc = (work.icc_profile if (not needs_convert and work.mode == MODE_RGB and work.icc_profile)
+               else ops.srgb_profile_bytes())
         ext = os.path.splitext(s.out_flat)[1].lower()
         if ext in (".tif", ".tiff"):
             write_tiff(s.out_flat, px, icc, doc.resolution)
