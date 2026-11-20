@@ -211,6 +211,7 @@ def _gui(tmp):
     write_psd(make_artboard_doc(), bsrc)
     w.open(bsrc)
     wait()
+    assert w.cmb_target.currentData() is None, "RGB file should default to No conversion"
     assert w.grp_boards.isVisibleTo(w) and w.lst_boards.count() == 3
     w._order_boards("position")
     names = [w.lst_boards.item(i).text().split("  ")[0] for i in range(3)]
@@ -221,8 +222,8 @@ def _gui(tmp):
     w.export_boards()
     wait()
     made = sorted(f for f in os.listdir(tmp) if f.startswith("boards_cleanup"))
-    assert made == ["boards_cleanup_v1_01_Square_sRGB.png", "boards_cleanup_v1_01_Square_sRGB.psd",
-                    "boards_cleanup_v1_02_Banner_sRGB.png", "boards_cleanup_v1_02_Banner_sRGB.psd"], made
+    assert made == ["boards_cleanup_v1_01_Square_RGB.png", "boards_cleanup_v1_01_Square_RGB.psd",
+                    "boards_cleanup_v1_02_Banner_RGB.png", "boards_cleanup_v1_02_Banner_RGB.psd"], made
     # Illustrator file through the window (resolution dialog bypassed)
     try:
         import pypdfium2  # noqa: F401
@@ -237,8 +238,8 @@ def _gui(tmp):
         w.export_boards()
         wait()
         made_ai = sorted(f for f in os.listdir(tmp) if f.startswith("gui_logo_cleanup"))
-        assert made_ai == ["gui_logo_cleanup_v1_01_Artboard_1_sRGB.png",
-                           "gui_logo_cleanup_v1_02_Artboard_2_sRGB.png"], made_ai
+        assert made_ai == ["gui_logo_cleanup_v1_01_Artboard_1_RGB.png",
+                           "gui_logo_cleanup_v1_02_Artboard_2_RGB.png"], made_ai
     except ImportError:
         pass
     w.close()
