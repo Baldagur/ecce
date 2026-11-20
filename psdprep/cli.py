@@ -65,6 +65,8 @@ def main(argv=None):
     ap.add_argument("--layer-order", action="store_true", help="number artboards in layers-panel order")
     ap.add_argument("--dpi", type=float, help="Illustrator/PDF input: render resolution (default 300)")
     ap.add_argument("--long-side", type=int, help="Illustrator/PDF input: longest side in pixels")
+    ap.add_argument("--nuke", action="store_true",
+                    help="layered PSD baked for Nuke's Breakout Layers (no groups/hidden/clipping/masks)")
     ap.add_argument("--overwrite", action="store_true",
                     help="allow replacing existing --out-psd/--out-flat files (never the input)")
     ap.add_argument("--version", action="version", version=__version__)
@@ -109,6 +111,7 @@ def main(argv=None):
             ap.error(f"--crop {a.crop} is outside the {doc.width}x{doc.height} image")
         s.crop = (x, y, w, h)
     s.overwrite = a.overwrite
+    s.nuke_psd = a.nuke
     s.target = a.to if a.to != "none" else "srgb"
     if a.check:
         from .check import conversion_check

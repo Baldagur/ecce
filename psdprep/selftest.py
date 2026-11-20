@@ -174,6 +174,8 @@ def _gui(tmp):
     assert made == ["gui_in_cleanup_v1_sRGB.png", "gui_in_cleanup_v1_sRGB.psd",
                     "gui_in_cleanup_v2_sRGB.psd"], made
     o = read_psd(os.path.join(tmp, "gui_in_cleanup_v1_sRGB.psd"))
+    assert w.chk_nuke.isChecked() and not any(L.is_group or L.clipping or not L.visible
+                                              for L in o.layers), "PSD not Nuke-friendly"
     assert (o.width, o.height) == (w.view.crop[2], w.view.crop[3])
     assert "v3" in w.lbl_next.text(), w.lbl_next.text()
     assert open(src, "rb").read() == before, "original changed"

@@ -307,6 +307,87 @@ def test_colour_tags_and_custom_names():
         assert naming.with_tag(stem, "Rec709").endswith("client_logo_v4_Rec709")
 
 
+def nuke_breakout(doc):
+    """What Nuke's Read > Breakout Layers does (nukescripts/psd.py): every
+    non-group layer in file order, merged with its own blend mode and opacity,
+    masked by its mask channel; visibility, groups, clipping and fill ignored."""
+    rgb = np.zeros((doc.height, doc.width, 3), np.float32)
+    a = np.zeros((doc.height, doc.width), np.float32)
+    for L in doc.layers:
+        if L.is_group or L.is_divider or not L.width:
+            continue
+        t, l = max(0, L.top), max(0, L.left)
+        b, r = min(doc.height, L.bottom), min(doc.width, L.right)
+        if b <= t or r <= l:
+            continue
+        sl = (slice(t - L.top, b - L.top), slice(l - L.left, r - L.left))
+        cs = np.stack([L.channels[c][sl] for c in range(3)], -1).astype(np.float32) / 255
+        al = L.channels[-1][sl].astype(np.float32) / 255 if -1 in L.channels else np.ones(cs.shape[:2])
+        if L.mask is not None and L.mask.data is not None and not L.mask.disabled:
+            mk = np.zeros((doc.height, doc.width), np.float32)        # mask channel: 0 outside its box
+            m = L.mask
+            if m.width and m.height:
+                mk[max(0, m.top):m.bottom, max(0, m.left):m.right] = \
+                    m.data[max(0, -m.top):, max(0, -m.left):][:m.bottom - max(0, m.top), :m.right - max(0, m.left)] / 255
+            al = al * mk[t:b, l:r]
+        al = al * L.opacity / 255
+        rgb[t:b, l:r], a[t:b, l:r] = ops.Compositor._blend_into(rgb[t:b, l:r], a[t:b, l:r], cs, al, L.blend_mode)
+    return rgb, a
+
+
+def tricky_doc():
+    """Hidden layer, hidden group, 50% group, group mask, clipping, fill 0, mask."""
+    d = PSD(width=16, height=8, depth=8, mode=MODE_RGB, num_channels=3)
+    div = lambda: Layer(name="</Layer group>", section=SECTION_DIVIDER)  # noqa: E731
+    bg = solid("bg", (40, 40, 40), rect=(0, 0, 8, 16))
+    hid = solid("hidden", (255, 255, 0), rect=(0, 0, 8, 4))
+    hid.visible = False
+    hgrp = Layer(name="hidden group", section=SECTION_OPEN, section_blend="pass")
+    hgrp.visible = False
+    half = Layer(name="half group", section=SECTION_OPEN, section_blend="pass", opacity=128)
+    half.mask = Mask(0, 0, 8, 12, 0, 0, np.full((8, 12), 255, np.uint8))     # hides x >= 12
+    base = solid("clip base", (0, 0, 255), rect=(0, 4, 8, 10))
+    clip = solid("clipped", (255, 0, 0), rect=(0, 0, 4, 16), clipping=1)
+    fill0 = solid("fill 0", (0, 255, 0), rect=(4, 0, 8, 16))
+    fill0.tagged.append((b"8BIM", b"iOpa", bytes([0, 0, 0, 0])))
+    masked = solid("masked", (255, 255, 255), rect=(6, 0, 8, 16))
+    masked.mask = Mask(0, 0, 0, 0, 255, 0, np.zeros((0, 0), np.uint8))          # reveal all (default 255)
+    d.layers = [bg, div(), solid("in hidden group", (255, 0, 255)), hgrp, hid,
+                div(), base, clip, fill0, half, masked]
+    return d
+
+
+def test_nuke_breakout_matches_after_baking():
+    d = tricky_doc()
+    want_rgb, want_a = composite(d)
+    raw_rgb, raw_a = nuke_breakout(d)
+    assert np.abs(raw_rgb * raw_a[..., None] - want_rgb * want_a[..., None]).max() > 0.3  # the bug
+    baked = roundtrip(ops.nuke_friendly(d))
+    names = [L.name for L in baked.layers]
+    assert "hidden" not in names and "in hidden group" not in names and "fill 0" not in names
+    assert not any(L.is_group or L.is_divider or L.clipping or L.mask for L in baked.layers)
+    got_rgb, got_a = nuke_breakout(baked)
+    err = np.abs(got_rgb * got_a[..., None] - want_rgb * want_a[..., None]).max()
+    assert err < 0.02, err
+    assert np.abs(got_a - want_a).max() < 0.02
+
+
+def test_nuke_psd_through_pipeline():
+    from psdprep.fixtures import make_doc
+    from psdprep.pipeline import Settings, process
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = os.path.join(tmp, "plain.psd"), os.path.join(tmp, "nuke.psd")
+        process(make_doc(8), Settings(out_psd=a), log=lambda *x: None)
+        process(make_doc(8), Settings(out_psd=b, nuke_psd=True), log=lambda *x: None)
+        want_rgb, want_a = composite(read_psd(a))
+        got_rgb, got_a = nuke_breakout(read_psd(b))
+        assert np.abs(got_a - want_a).max() < 0.02
+        assert np.abs(got_rgb * got_a[..., None] - want_rgb * want_a[..., None]).max() < 0.02
+        names = [L.name for L in read_psd(b).layers]
+        assert all(n.isascii() for n in names) and "Cyan circle e" in names, names
+        assert all(L.left >= 0 and L.right <= 320 for L in read_psd(b).layers)
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

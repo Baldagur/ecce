@@ -46,6 +46,20 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   embedded colour profile and its colour space.
 * **The original is protected.** Every write is checked against the source file (resolved
   paths and hard links included) and refused if it matches, from the GUI and the command line.
+* **Layered PSD → Nuke-friendly** (on by default). Nuke's *Read > Breakout Layers* rebuilds
+  the image very simply. It skips groups and ignores the eye (hidden layers), clipping, fill
+  opacity and mask defaults, and it stops at the first layer with a non-ASCII name. With this
+  on, the saved PSD is baked so Nuke rebuilds exactly what you see:
+  * hidden layers are left out;
+  * groups are dissolved, and a group with its own opacity or blend mode becomes one merged
+    layer;
+  * masks, fill and clipping are baked into each layer's alpha;
+  * names are made ASCII and unique (`Cyan circé` → `Cyan circe`);
+  * layers are trimmed to the canvas.
+
+  The image is the same; only the layer structure is simplified. A test runs Nuke's breakout
+  logic on the result and checks that it matches. Untick it to keep the Photoshop structure
+  (groups, masks, hidden layers).
 * **Save to**, with the colour space always at the end of the name:
   * **Next to the original, auto-named** (default): writes into the source folder as
     `<name>_<suffix>_v1_sRGB.png`, then `_v2`… The suffix defaults to `cleanup` and you can edit
@@ -115,12 +129,13 @@ PSDPrep in.psd --auto both                     # -> in_cleanup_v1_sRGB.psd + .pn
 PSDPrep in.psd --to rec709 --auto flat --folder /jobs/out --name "Client Logo"
                                                # -> /jobs/out/Client_Logo_v1_Rec709.png
 PSDPrep in.psd --check --to rec709             # print the ΔE2000 conversion report
+PSDPrep in.psd --nuke --auto psd               # layered PSD baked for Nuke's Breakout Layers
 PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>_sRGB.png, _02_…
 PSDPrep logo.ai --long-side 4000 --auto flat --artboards   # Illustrator: one PNG per artboard
 PSDPrep logo.ai --dpi 300 --out-flat logo.tif            # all artboards laid out in one image
 ```
 
-## Limits (v0.5)
+## Limits (v0.6)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.

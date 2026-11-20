@@ -504,7 +504,9 @@ class Compositor:
     hidden: optional set of id(layer) treated as invisible (UI toggles).
     """
 
-    def __init__(self, doc: PSD, get_rgb: Callable, scale: int = 1, hidden: set = None):
+    def __init__(self, doc: PSD, get_rgb: Callable, scale: int = 1, hidden: set = None,
+                 channels: int = 3):
+        self.nch = channels
         self.doc = doc
         self.get_rgb = get_rgb
         self.s = max(1, int(scale))
@@ -660,7 +662,7 @@ class Compositor:
                 self._draw_node(base, rgb, alpha)
 
     def run(self):
-        rgb = np.zeros((self.H, self.W, 3), np.float32)
+        rgb = np.zeros((self.H, self.W, self.nch), np.float32)
         alpha = np.zeros((self.H, self.W), np.float32)
         self._composite_nodes(build_tree(self.doc.layers), rgb, alpha)
         return rgb, alpha
@@ -733,4 +735,166 @@ def clone(doc: PSD) -> PSD:
         nl.tagged = list(L.tagged)
         nl.mask = copy.copy(L.mask) if L.mask else None
         new.layers.append(nl)
+    return new
+
+
+# ---------------------------------------------------------------------------
+# Nuke-friendly layered PSD
+# ---------------------------------------------------------------------------
+def nuke_friendly(doc: PSD, log: Callable = None) -> PSD:
+    """Rewrite the layers so Nuke's Read > Breakout Layers rebuilds the same
+    image. Nuke's breakout skips groups and ignores visibility, clipping, fill
+    opacity and mask defaults, so all of that is baked in:
+
+    * hidden layers, and everything in hidden groups, are removed;
+    * groups are dissolved: group opacity is multiplied into each child's
+      opacity, group masks are multiplied into each child's alpha;
+    * layer masks, fill opacity and clipping (alpha of the clip base) are
+      multiplied into the layer's own alpha, then the mask is dropped;
+    * empty layers are dropped.
+    What's left is a flat list of pixel layers with alpha, opacity and blend
+    mode only. Group blend modes other than Pass Through can't be expressed
+    and are reported."""
+    out_layers = []
+    notes = set()
+    rastered = []
+    maxv = doc.max_value
+    nc = doc.color_channels
+
+    def raster_group(node) -> Optional[Layer]:
+        """The group's visible contents merged into one layer (isolated)."""
+        sub = copy.copy(doc)
+        sub.layers = flatten_tree(node.children)
+
+        def raw(L, src):
+            if not all(c in L.channels for c in range(nc)):
+                return None
+            return np.stack([L.channels[c][src] for c in range(nc)], -1).astype(np.float32) / maxv
+        col, a = Compositor(sub, raw, 1, None, nc).run()
+        ys, xs = np.nonzero(a > 0)
+        if ys.size == 0:
+            return None
+        t, b, l, r = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        ch = {c: np.clip(np.rint(col[t:b, l:r, c] * maxv), 0, maxv).astype(doc.dtype) for c in range(nc)}
+        ch[-1] = np.clip(np.rint(a[t:b, l:r] * maxv), 0, maxv).astype(doc.dtype)
+        return Layer(name=node.layer.name, top=int(t), left=int(l), bottom=int(b), right=int(r),
+                     channels=ch)
+
+    def mask_on(rect, m: Mask) -> Optional[np.ndarray]:
+        """Mask values (0..1) over rect=(top,left,bottom,right)."""
+        if m is None or m.data is None or m.disabled:
+            return None
+        t, l, b, r = rect
+        plane = np.full((b - t, r - l), m.default_color / 255.0, np.float32)
+        if m.width and m.height and m.data.size:
+            it, il = max(t, m.top), max(l, m.left)
+            ib, ir = min(b, m.bottom), min(r, m.right)
+            if ib > it and ir > il:
+                plane[it - t:ib - t, il - l:ir - l] = \
+                    m.data[it - m.top:ib - m.top, il - m.left:ir - m.left].astype(np.float32) / maxv
+        return plane
+
+    def shape_of(L: Layer, rect) -> np.ndarray:
+        """Base layer's alpha x mask over rect (for clipping)."""
+        t, l, b, r = rect
+        a = np.zeros((b - t, r - l), np.float32)
+        it, il = max(t, L.top), max(l, L.left)
+        ib, ir = min(b, L.bottom), min(r, L.right)
+        if ib > it and ir > il:
+            src = (L.channels[-1][it - L.top:ib - L.top, il - L.left:ir - L.left].astype(np.float32) / maxv
+                   if -1 in L.channels else 1.0)
+            a[it - t:ib - t, il - l:ir - l] = src
+        m = mask_on(rect, L.mask)
+        return a if m is None else a * m
+
+    def emit(L: Layer, opacity_factor: float, group_masks: list, base: Optional[Layer]):
+        if not (L.width and L.height) or not all(c in L.channels for c in range(doc.color_channels)):
+            return
+        rect = (L.top, L.left, L.bottom, L.right)
+        a = (L.channels[-1].astype(np.float32) / maxv if -1 in L.channels
+             else np.ones((L.height, L.width), np.float32))
+        for m in [L.mask] + group_masks:
+            mm = mask_on(rect, m)
+            if mm is not None:
+                a = a * mm
+        a = a * (L.fill_opacity / 255.0)
+        opacity = L.opacity / 255.0 * opacity_factor
+        if L.clipping and base is not None:
+            a = a * shape_of(base, rect)
+            opacity *= base.opacity / 255.0
+        if not a.any():
+            return
+        nl = copy.copy(L)
+        nl.channels = dict(L.channels)
+        nl.channels[-1] = np.clip(np.rint(a * maxv), 0, maxv).astype(doc.dtype)
+        nl.mask = None
+        nl.clipping = 0
+        nl.visible = True
+        nl.opacity = int(round(min(1.0, opacity) * 255))
+        nl.tagged = [t for t in L.tagged if t[1] != b"iOpa"]
+        nl.section = 0
+        out_layers.append(nl)
+
+    def walk_nodes(nodes, factor, gmasks):
+        base, base_visible = None, True
+        for n in nodes:
+            L = n.layer
+            if not L.clipping:
+                base, base_visible = (None if n.is_group else L), L.visible
+            if not L.visible or (L.clipping and not base_visible):
+                continue
+            if n.is_group:
+                mode = L.blend()
+                gm = gmasks + ([L.mask] if (L.mask is not None and not L.mask.disabled) else [])
+                if mode == "pass" and L.opacity == 255:
+                    walk_nodes(n.children, factor, gm)          # dissolves exactly
+                else:
+                    # group opacity / blend act on the merged group: merge it
+                    merged = raster_group(n)
+                    if merged is not None:
+                        merged.opacity = L.opacity
+                        merged.blend_mode = "norm" if mode == "pass" else mode
+                        merged.mask = None
+                        emit(merged, factor, gm, None)
+                        rastered.append(L.name)
+                continue
+            if L.clipping and base is None:
+                notes.add(f"clipping of '{L.name}' to a group")
+            emit(L, factor, gmasks, base if L.clipping else None)
+
+    walk_nodes(build_tree(doc.layers), 1.0, [])
+    # Nuke-specific clean-up
+    import unicodedata
+    renamed = []
+    seen = {}
+    for L in out_layers:
+        # Nuke stops breaking out at the first non-ASCII layer name (Foundry bug 535819)
+        ascii_name = unicodedata.normalize("NFKD", L.name).encode("ascii", "ignore").decode()
+        ascii_name = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in ascii_name).strip() or "layer"
+        n = seen.get(ascii_name, 0)
+        seen[ascii_name] = n + 1
+        if n:
+            ascii_name = f"{ascii_name} {n + 1}"          # unique names -> unique Nuke channels
+        if ascii_name != L.name:
+            renamed.append(f"{L.name} → {ascii_name}")
+            L.name = ascii_name
+        # keep pixels on the canvas only
+        t, l = max(0, L.top), max(0, L.left)
+        b, r = min(doc.height, L.bottom), min(doc.width, L.right)
+        if (t, l, b, r) != (L.top, L.left, L.bottom, L.right) and b > t and r > l:
+            L.channels = {k: np.ascontiguousarray(v[t - L.top:b - L.top, l - L.left:r - L.left])
+                          for k, v in L.channels.items()}
+            L.top, L.left, L.bottom, L.right = t, l, b, r
+    out_layers = [L for L in out_layers if L.bottom > L.top and L.right > L.left
+                  and 0 <= L.top and L.bottom <= doc.height]
+    new = copy.copy(doc)
+    new.layers = out_layers
+    if log and renamed:
+        log("Nuke-friendly PSD: renamed for Nuke: " + ", ".join(renamed[:8]))
+    if log and len(out_layers) > 100:
+        log(f"Nuke-friendly PSD: {len(out_layers)} layers — Nuke's Breakout Layers stops at 100.")
+    if log and rastered:
+        log("Nuke-friendly PSD: merged into one layer (group opacity/blend): " + ", ".join(rastered))
+    if log and notes:
+        log("Nuke-friendly PSD: can't keep " + ", ".join(sorted(notes)))
     return new

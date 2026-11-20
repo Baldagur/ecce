@@ -34,6 +34,7 @@ class Settings:
     artboard: Optional[Artboard] = None               # export just this artboard
     artboard_transparent: bool = False                # ignore the artboard's background colour
     target: str = "srgb"                              # colorspaces.TARGETS key
+    nuke_psd: bool = False                            # bake layers for Nuke's Breakout Layers
     overwrite: bool = False                           # allow replacing existing outputs (never the original)
 
 
@@ -151,7 +152,8 @@ def process(doc: PSD, s: Settings, log: Callable = print, progress: Callable = N
             merged, has_a = None, False
             result["warnings"].append("PSD kept in its original colour mode: the stored preview "
                                       "composite is blank (Photoshop rebuilds it on open).")
-        write_psd(work, s.out_psd, merged, has_a)
+        layered = ops.nuke_friendly(work, log) if s.nuke_psd else work
+        write_psd(layered, s.out_psd, merged, has_a)
         log(f"Wrote {s.out_psd}")
         result["psd"] = s.out_psd
 

@@ -518,6 +518,20 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addWidget(g)
 
         # output
+        g = QtWidgets.QGroupBox("Layered PSD")
+        f = QtWidgets.QFormLayout(g)
+        self.chk_nuke = QtWidgets.QCheckBox("Nuke-friendly (for Read > Breakout Layers)")
+        self.chk_nuke.setChecked(self.settings.value("nuke_psd", "true") in (True, "true"))
+        self.chk_nuke.setToolTip(
+            "Nuke's Breakout Layers skips groups and ignores hidden layers, clipping, fill and mask "
+            "defaults. This bakes them into each layer so Nuke rebuilds exactly this image:\n"
+            "• hidden layers are left out\n• groups are dissolved (a group with opacity or a blend "
+            "mode becomes one merged layer)\n• masks, fill and clipping are baked into each layer's alpha\n"
+            "Untick to keep the Photoshop structure (groups, masks, hidden layers).")
+        self.chk_nuke.toggled.connect(lambda v: self.settings.setValue("nuke_psd", "true" if v else "false"))
+        f.addRow(self.chk_nuke)
+        rv.addWidget(g)
+
         g = QtWidgets.QGroupBox("Flattened export")
         f = QtWidgets.QFormLayout(g)
         self.cmb_fmt = QtWidgets.QComboBox()
@@ -966,7 +980,8 @@ class MainWindow(QtWidgets.QMainWindow):
             use_embedded=True, cmyk_profile=self.cmyk_profile,
             intent="Relative Colorimetric", bpc=True,
             flatten_source=["auto", "layers", "composite"][self.cmb_source.currentIndex()],
-            flat_depth=depth, flat_alpha=self.chk_alpha.isChecked())
+            flat_depth=depth, flat_alpha=self.chk_alpha.isChecked(),
+            nuke_psd=self.chk_nuke.isChecked())
 
     def _colour_changed(self, *a):
         self.rgb_cache = {}
