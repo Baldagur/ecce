@@ -4,6 +4,9 @@ Open a PSD, then **remove layers**, **crop**, and **convert CMYK → sRGB**. Sav
 **layered PSD** and/or a **flattened PNG/TIFF with alpha**. It's built for Rocky Linux and works
 without internet access.
 
+It also opens **Illustrator (.ai) and PDF files**: they're rendered to pixels with a
+transparent background, and each artboard can be exported as its own PNG/TIFF with alpha.
+
 ## Use
 
 ```
@@ -42,6 +45,28 @@ PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
   Flattened files are always sRGB, have straight (unpremultiplied) alpha and an embedded sRGB
   profile, at 8 or 16 bits.
 
+### Illustrator and PDF files
+
+* Open or drop a `.ai` or `.pdf`. A small window asks for the size, since vector art has none:
+  * **Resolution (DPI)**, e.g. 300 for print quality at the artwork's real size, or
+  * **Longest side (px)**, e.g. 4000, for an exact pixel size (usually best for comp/screen use).
+
+  It shows the resulting pixel size before rendering. **Change resolution…** in the toolbar
+  renders it again.
+* Each Illustrator artboard (PDF page) shows up in the **Artboards** list. Export them
+  numbered as PNG/TIFF, `logo_cleanup_v1_01_Artboard_1.png`, … The background is
+  transparent: alpha is 0 where there's no artwork, with soft anti-aliased edges and real
+  transparency where the art is see-through.
+* The preview, crop and auto-naming work as for PSDs. PSD saving is turned off for these files.
+* Limits:
+  * `.ai` files must have been saved with **Create PDF Compatible File** (Illustrator's default).
+    Files without it, and very old pre-CS files, show a message instead.
+  * Illustrator layers can't be read, so each artboard is one flat image.
+  * Artboard names aren't stored in the PDF part, so they're numbered *Artboard 1, 2…* in
+    Illustrator's order.
+  * Colour is converted to RGB by the PDF engine (PDFium, the one in Chrome). Artwork with an
+    embedded profile converts accurately; plain untagged CMYK uses a simple conversion.
+
 ### "Image from" (flattened output)
 
 * **Auto** (default): if no layers were removed or hidden, the tool uses Photoshop's own saved
@@ -65,9 +90,11 @@ PSDPrep in.psd --remove "Retouch*" --remove-hidden --crop 0,0,1920,1080 \
 PSDPrep in.psd --profile /path/CoatedFOGRA39.icc --out-flat out.tif
 PSDPrep in.psd --auto both                     # -> in_cleanup_v1.psd + .png next to in.psd
 PSDPrep in.psd --auto flat --artboards         # -> in_cleanup_v1_01_<name>.png, _02_…
+PSDPrep logo.ai --long-side 4000 --auto flat --artboards   # Illustrator: one PNG per artboard
+PSDPrep logo.ai --dpi 300 --out-flat logo.tif            # all artboards laid out in one image
 ```
 
-## Limits (v0.2)
+## Limits (v0.4)
 
 * Supports 8 and 16-bit Grayscale/RGB/CMYK/Lab PSD and PSB. 32-bit, indexed, duotone and
   bitmap files aren't supported yet.
@@ -130,6 +157,7 @@ psdprep/pipeline.py  settings -> outputs
 psdprep/gui.py       PySide6 UI (falls back to PySide2)
 psdprep/cli.py       command line / entry point
 psdprep/artboards.py artboard detection / ordering
+psdprep/vector.py    Illustrator/PDF rendering (pypdfium2)
 psdprep/naming.py    auto names, versions, original-file guard
 psdprep/descriptor.py Photoshop descriptor parser
 psdprep/selftest.py  headless self-test (run by CI on the built app)

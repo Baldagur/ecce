@@ -2,7 +2,7 @@
 machines that run it. Run on the OS you ship (no cross-builds):
 
     python3 -m venv build-venv
-    build-venv/bin/pip install pyinstaller pyside6-essentials pillow numpy
+    build-venv/bin/pip install pyinstaller pyside6-essentials pillow numpy pypdfium2
     build-venv/bin/python build.py
 
 Linux: build on the OLDEST distro you support (Rocky 8 -> runs on Rocky 8 and 9).
@@ -45,6 +45,9 @@ args = [
     "--hidden-import", "psdprep.selftest",
     "--hidden-import", "psdprep.fixtures",
     "--hidden-import", "psdprep.desktop",
+    "--hidden-import", "psdprep.vector",
+    "--collect-all", "pypdfium2",
+    "--collect-all", "pypdfium2_raw",
     "--hidden-import", "psdprep._build_stamp",
     "--hidden-import", "PIL.ImageCms",
     *sum((["--exclude-module", m] for m in (

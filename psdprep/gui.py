@@ -67,6 +67,73 @@ def _load(path, log=None, progress=None):
     return read_psd(path)
 
 
+def _load_vector(path, dpi, long_side, log=None, progress=None):
+    from .vector import load_vector
+    return load_vector(path, dpi, long_side, progress)
+
+
+class ResolutionDialog(QtWidgets.QDialog):
+    """Asked when opening an Illustrator/PDF file: vector art has no pixel
+    size, so pick one."""
+
+    def __init__(self, parent, path, pages, settings):
+        super().__init__(parent)
+        self.setWindowTitle("Render Illustrator / PDF")
+        self.pages = pages
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(f"<b>{os.path.basename(path)}</b> — {len(pages)} artboard(s), "
+                                     f"first one {pages[0].size_text}"))
+        f = QtWidgets.QGridLayout()
+        self.rad_dpi = QtWidgets.QRadioButton("Resolution (DPI)")
+        self.rad_long = QtWidgets.QRadioButton("Longest side (px)")
+        self.spn_dpi = QtWidgets.QSpinBox()
+        self.spn_dpi.setRange(18, 2400)
+        self.spn_dpi.setValue(int(settings.value("vec_dpi", 300)))
+        self.spn_long = QtWidgets.QSpinBox()
+        self.spn_long.setRange(16, 20000)
+        self.spn_long.setSingleStep(100)
+        self.spn_long.setValue(int(settings.value("vec_long", 4000)))
+        (self.rad_long if settings.value("vec_mode", "dpi") == "long" else self.rad_dpi).setChecked(True)
+        f.addWidget(self.rad_dpi, 0, 0)
+        f.addWidget(self.spn_dpi, 0, 1)
+        f.addWidget(self.rad_long, 1, 0)
+        f.addWidget(self.spn_long, 1, 1)
+        v.addLayout(f)
+        self.lbl = QtWidgets.QLabel("")
+        self.lbl.setStyleSheet("color: #999;")
+        self.lbl.setWordWrap(True)
+        v.addWidget(self.lbl)
+        bb = QtWidgets.QDialogButtonBox(E(QtWidgets.QDialogButtonBox, "StandardButton", "Ok")
+                                        | E(QtWidgets.QDialogButtonBox, "StandardButton", "Cancel"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        for w in (self.rad_dpi, self.rad_long):
+            w.toggled.connect(self._update)
+        self.spn_dpi.valueChanged.connect(self._update)
+        self.spn_long.valueChanged.connect(self._update)
+        self._update()
+
+    def values(self):
+        if self.rad_long.isChecked():
+            return None, self.spn_long.value()
+        return self.spn_dpi.value(), None
+
+    def _update(self, *a):
+        dpi, long_side = self.values()
+        sizes = [p.pixels(dpi, long_side) for p in self.pages[:4]]
+        txt = ", ".join(f"{w} × {h}" for w, h in sizes)
+        if len(self.pages) > 4:
+            txt += " …"
+        self.lbl.setText(f"Pixel size: {txt}\n300 DPI = print quality at real size. For screen/"
+                         f"comp use, 'Longest side' gives an exact pixel size.")
+
+    def remember(self, settings):
+        settings.setValue("vec_mode", "long" if self.rad_long.isChecked() else "dpi")
+        settings.setValue("vec_dpi", self.spn_dpi.value())
+        settings.setValue("vec_long", self.spn_long.value())
+
+
 # ---------------------------------------------------------------------------
 # Preview with crop box
 # ---------------------------------------------------------------------------
@@ -307,6 +374,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_flat = tb.addAction("Export flattened", lambda: self.export(psd=False, flat=True))
         self.act_both = tb.addAction("Save both", lambda: self.export(psd=True, flat=True))
         tb.addSeparator()
+        self.act_rerender = tb.addAction("Change resolution…", self._rerender)
+        self.act_rerender.setVisible(False)
         tb.addAction("Fit view", lambda: self.view.fit())
 
         split = QtWidgets.QSplitter()
@@ -513,8 +582,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_source.currentIndexChanged.connect(self.schedule_preview)
 
     def _set_enabled(self, on):
-        for a in (self.act_psd, self.act_flat, self.act_both):
-            a.setEnabled(on)
+        vector = self.doc is not None and self.doc.source_kind == "vector"
+        self.act_flat.setEnabled(on)
+        # Illustrator/PDF sources export flattened PNG/TIFF only
+        self.act_psd.setEnabled(on and not vector)
+        self.act_both.setEnabled(on and not vector)
+        self.act_rerender.setVisible(on and vector)
+        self.chk_board_psd.setEnabled(not vector)
+        if vector:
+            self.chk_board_psd.setChecked(False)
+            self.chk_board_flat.setChecked(True)
 
     def log(self, msg):
         self.logbox.appendPlainText(msg)
@@ -522,8 +599,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- open ---------------------------------------------------------
     def open_dialog(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open Photoshop file", self.settings.value("last_dir", ""),
-            "Photoshop (*.psd *.psb);;All files (*)")
+            self, "Open file", self.settings.value("last_dir", ""),
+            "Photoshop / Illustrator / PDF (*.psd *.psb *.ai *.pdf);;All files (*)")
         if p:
             self.open(p)
 
@@ -534,14 +611,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def dropEvent(self, ev):
         for u in ev.mimeData().urls():
             p = u.toLocalFile()
-            if p.lower().endswith((".psd", ".psb")):
+            if p.lower().endswith((".psd", ".psb", ".ai", ".pdf")):
                 self.open(p)
                 break
 
     def open(self, path):
         self.settings.setValue("last_dir", os.path.dirname(path))
+        from .vector import is_vector, page_infos, VectorError
+        if is_vector(path):
+            try:
+                pages = page_infos(path)
+            except VectorError as e:
+                QtWidgets.QMessageBox.warning(self, "PSD Prep", str(e))
+                return
+            dlg = ResolutionDialog(self, path, pages, self.settings)
+            ok = dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+            if not ok:
+                return
+            dlg.remember(self.settings)
+            self._open_vector(path, *dlg.values())
+            return
         self.log(f"Opening {path}")
         self._run(_load, path, on_done=lambda doc: self._loaded(path, doc))
+
+    def _open_vector(self, path, dpi=None, long_side=None):
+        how = f"{dpi} DPI" if dpi else f"longest side {long_side} px"
+        self.log(f"Rendering {path} at {how}")
+        self._run(_load_vector, path, dpi, long_side, on_done=lambda doc: self._loaded(path, doc))
+
+    def _rerender(self):
+        if self.path and self.doc is not None and self.doc.source_kind == "vector":
+            self.open(self.path)
 
     def _loaded(self, path, doc):
         self.doc, self.path = doc, path
@@ -605,8 +705,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 out.append(self.boards[it.data(E(Qt, "ItemDataRole", "UserRole"))])
         return out
 
+    def _update_vector_info(self):
+        d = self.doc
+        o = self.orig
+        pages = d.vector_pages
+        o["file"].setText(os.path.basename(self.path))
+        o["file"].setToolTip(self.path)
+        kind = "Adobe Illustrator" if self.path.lower().endswith(".ai") else "PDF"
+        o["size"].setText(", ".join(p.size_text for p in pages[:3]) + (" …" if len(pages) > 3 else ""))
+        o["mode"].setText(f"<b>{kind} (vector)</b> — rendered to RGB")
+        o["depth"].setText("8-bit")
+        o["profile"].setText("— (colour handled by the PDF renderer)")
+        o["space"].setText("—")
+        vs = d.vector_settings
+        o["res"].setText(f"{vs['dpi']} dpi" if vs.get("dpi") else f"longest side {vs.get('long_side')} px")
+        o["layers"].setText("flattened per artboard (Illustrator layers can't be read)")
+        o["boards"].setText(str(len(pages)))
+        self.info.setVisible(False)
+
     def _update_info(self):
         d = self.doc
+        if d.source_kind == "vector":
+            self._update_vector_info()
+            return
         prof = d.icc_profile
         pdesc = ops.profile_info(prof)[1] if prof else "none"
         res = d.resolution
@@ -1121,7 +1242,7 @@ def main(argv=None):
     w = MainWindow()
     w.show()
     for a in argv[1:]:
-        if a.lower().endswith((".psd", ".psb")) and os.path.isfile(a):
+        if a.lower().endswith((".psd", ".psb", ".ai", ".pdf")) and os.path.isfile(a):
             w.open(a)
             break
     return app.exec() if hasattr(app, "exec") else app.exec_()

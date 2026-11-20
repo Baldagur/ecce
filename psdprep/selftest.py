@@ -70,6 +70,26 @@ def _pipeline(tmp):
     return ", ".join(out) + f"; CMYK profile: {desc or 'none found (simple formula)'}"
 
 
+def _vector(tmp):
+    from .artboards import find_artboards
+    from .pipeline import Settings, export_artboards
+    from .vector import load_vector, make_test_pdf, render_page
+    src = os.path.join(tmp, "logo.ai")
+    make_test_pdf(src)                       # PDF-compatible .ai = a PDF inside
+    img = render_page(src, 0, dpi=144)
+    assert img.shape == (200, 400, 4), img.shape
+    assert img[0, 0, 3] == 0 and tuple(img[100, 100]) == (255, 0, 0, 255)
+    half = render_page(src, 1, long_side=50)[25, 25]
+    assert half[2] == 255 and 120 < half[3] < 135, half
+    doc = load_vector(src, long_side=1000)
+    boards = find_artboards(doc)
+    assert [b.rect[2:] for b in boards] == [(1000, 500), (1000, 1000)]
+    res = export_artboards(doc, Settings(source_path=src), boards,
+                           os.path.join(tmp, "logo_cleanup_v1"), False, ".png", log=lambda *a: None)
+    assert len(res["written"]) == 2
+    return "Illustrator/PDF render with alpha, 2 artboards exported"
+
+
 def _gui(tmp):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from .fixtures import make_doc
@@ -156,6 +176,23 @@ def _gui(tmp):
     made = sorted(f for f in os.listdir(tmp) if f.startswith("boards_cleanup"))
     assert made == ["boards_cleanup_v1_01_Square.png", "boards_cleanup_v1_01_Square.psd",
                     "boards_cleanup_v1_02_Banner.png", "boards_cleanup_v1_02_Banner.psd"], made
+    # Illustrator file through the window (resolution dialog bypassed)
+    try:
+        import pypdfium2  # noqa: F401
+        from .vector import make_test_pdf
+        ai = os.path.join(tmp, "gui_logo.ai")
+        make_test_pdf(ai)
+        w._open_vector(ai, dpi=144)
+        wait()
+        assert w.doc.source_kind == "vector" and w.lst_boards.count() == 2
+        assert not w.act_psd.isEnabled() and w.act_flat.isEnabled()
+        w.export_boards()
+        wait()
+        made_ai = sorted(f for f in os.listdir(tmp) if f.startswith("gui_logo_cleanup"))
+        assert made_ai == ["gui_logo_cleanup_v1_01_Artboard_1.png",
+                           "gui_logo_cleanup_v1_02_Artboard_2.png"], made_ai
+    except ImportError:
+        pass
     w.close()
     app.processEvents()
     return f"window ok; auto-named v1/v2; {len(made)} artboard files"
@@ -169,6 +206,11 @@ def run(log_path=None) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         r.step("PSD read/write", lambda: _roundtrip(tmp))
         r.step("Edit + convert + export", lambda: _pipeline(tmp))
+        try:
+            import pypdfium2  # noqa: F401
+            r.step("Illustrator / PDF", lambda: _vector(tmp))
+        except ImportError:
+            r.skip("Illustrator / PDF", "pypdfium2 not installed")
         try:
             import PySide6  # noqa: F401
             r.step("Window (offscreen)", lambda: _gui(tmp))

@@ -228,6 +228,27 @@ def test_original_and_existing_files_protected():
             pass
 
 
+def test_illustrator_pdf():
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:
+        print("  (skipped Illustrator test: pypdfium2 not installed)")
+        return
+    from psdprep import vector
+    with tempfile.TemporaryDirectory() as tmp:
+        ai = os.path.join(tmp, "a.ai")
+        vector.make_test_pdf(ai)
+        img = vector.render_page(ai, 1, dpi=36)              # 50% blue
+        assert tuple(img[10, 10][:3]) == (0, 0, 255) and 120 < img[10, 10, 3] < 135
+        ps = os.path.join(tmp, "old.ai")
+        open(ps, "wb").write(b"%!PS-Adobe-3.0\n%%Creator: Adobe Illustrator 8\n")
+        try:
+            vector.page_infos(ps)
+            raise AssertionError("PostScript .ai accepted")
+        except vector.VectorError as e:
+            assert "PDF compatib" in str(e)
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

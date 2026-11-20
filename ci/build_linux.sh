@@ -12,7 +12,7 @@ dnf install -y python3.11 python3.11-pip tar findutils git ghostscript \
 
 python3.11 -m venv /tmp/venv
 /tmp/venv/bin/pip install --upgrade pip
-/tmp/venv/bin/pip install pyinstaller pyside6-essentials pillow numpy
+/tmp/venv/bin/pip install pyinstaller pyside6-essentials pillow numpy pypdfium2
 
 # Bundle Ghostscript's generic CMYK profile as a fallback for untagged CMYK files
 # (files with an embedded profile always use their own).

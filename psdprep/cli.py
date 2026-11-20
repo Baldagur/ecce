@@ -14,7 +14,7 @@ from .psdfile import MODE_NAMES, read_psd
 
 
 def _wants_gui(argv):
-    return not argv or (len(argv) == 1 and argv[0].lower().endswith((".psd", ".psb")))
+    return not argv or (len(argv) == 1 and argv[0].lower().endswith((".psd", ".psb", ".ai", ".pdf")))
 
 
 def main(argv=None):
@@ -57,12 +57,21 @@ def main(argv=None):
     ap.add_argument("--artboards", action="store_true",
                     help="with --auto: export each artboard on its own, numbered in reading order")
     ap.add_argument("--layer-order", action="store_true", help="number artboards in layers-panel order")
+    ap.add_argument("--dpi", type=float, help="Illustrator/PDF input: render resolution (default 300)")
+    ap.add_argument("--long-side", type=int, help="Illustrator/PDF input: longest side in pixels")
     ap.add_argument("--overwrite", action="store_true",
                     help="allow replacing existing --out-psd/--out-flat files (never the input)")
     ap.add_argument("--version", action="version", version=__version__)
     a = ap.parse_args(argv)
 
-    doc = read_psd(a.psd)
+    from .vector import is_vector, load_vector, VectorError
+    if is_vector(a.psd):
+        try:
+            doc = load_vector(a.psd, a.dpi if not a.long_side else None, a.long_side)
+        except VectorError as e:
+            ap.error(str(e))
+    else:
+        doc = read_psd(a.psd)
     if a.list or not (a.out_psd or a.out_flat or a.auto):
         print(f"{a.psd}: {doc.width}x{doc.height} {MODE_NAMES.get(doc.mode)} {doc.depth}-bit, "
               f"profile: {ops.profile_info(doc.icc_profile)[1] if doc.icc_profile else 'none'}")

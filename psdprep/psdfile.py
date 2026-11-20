@@ -169,6 +169,9 @@ class PSD:
     layers: list = field(default_factory=list)     # bottom -> top
     merged: Optional[np.ndarray] = None            # (C, H, W) or None
     merged_has_alpha: bool = False
+    source_kind: str = "psd"                       # "psd" or "vector" (.ai / .pdf)
+    vector_pages: list = field(default_factory=list)
+    vector_settings: dict = field(default_factory=dict)
 
     @property
     def color_channels(self) -> int:
