@@ -111,7 +111,8 @@ def _gui(tmp):
     w = gui.MainWindow()
     w.show()
     import time
-    w.open(src)                                    # same path as drag & drop (worker thread)
+    w.txt_path.setText(' "' + src + '" \n')       # pasted path, quoted, with junk around it
+    w._open_typed_path()                           # same as pressing Enter in the path box
     t0 = time.time()
     while (w.doc is None or w.thread is not None) and time.time() - t0 < 30:
         app.processEvents()
@@ -209,6 +210,11 @@ def _gui(tmp):
     from .fixtures import make_artboard_doc
     bsrc = os.path.join(tmp, "boards.psd")
     write_psd(make_artboard_doc(), bsrc)
+    cb = gui.QtWidgets.QApplication.clipboard()
+    cb.setText("file://" + bsrc)                 # as a file manager would copy it
+    app.processEvents()
+    if cb.text():                                # offscreen clipboard available
+        assert w._path_from_clipboard() == bsrc, w._path_from_clipboard()
     w.open(bsrc)
     wait()
     assert w.cmb_target.currentData() is None, "RGB file should default to No conversion"

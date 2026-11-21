@@ -14,6 +14,9 @@ PSDPrep/PSDPrep                 # GUI (or double-click)
 PSDPrep/PSDPrep file.psd        # GUI with a file open (drag & drop works too)
 ```
 
+* **Opening files**: *Open PSD…*, drag & drop, or **paste a path** into the box in the toolbar
+  and press Enter. Quotes, `file://` links, `~` and `$VARIABLES` are all fine. **Ctrl+V**
+  anywhere in the window also opens a copied path, or a file you copied in the file manager.
 * **Layers panel**: untick a layer to remove it. Removing a group removes everything in it.
   The eye column toggles visibility. **Ctrl/Shift-click** selects several layers: clicking
   the eye (or tick) of one of them then sets all of them. **Show selected** / **Hide selected**

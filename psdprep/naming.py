@@ -80,3 +80,38 @@ def guard(source: str, outputs: list):
     for p in outputs:
         if p and source and is_same_file(source, p):
             raise ProtectedFileError(f"Refusing to overwrite the original file: {p}")
+
+
+OPEN_EXTS = (".psd", ".psb", ".ai", ".pdf")
+
+
+def clean_pasted_path(text: str) -> str:
+    """Turn whatever was pasted into a path: strips spaces/newlines and
+    surrounding quotes, decodes file:// URLs (file managers copy those),
+    expands ~ and $VARS, and takes the first line of a multi-line paste."""
+    from urllib.parse import unquote, urlparse
+    lines = [ln.strip() for ln in (text or "").replace("\r", "\n").split("\n") if ln.strip()]
+    if not lines:
+        return ""
+    t = lines[0]
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    if t.lower().startswith("file://"):
+        t = unquote(urlparse(t).path)
+    t = os.path.expandvars(os.path.expanduser(t))
+    return os.path.normpath(t) if t else ""
+
+
+def check_open_path(path: str) -> str:
+    """'' if path can be opened, otherwise a short reason for the user."""
+    if not path:
+        return "Paste a file path first."
+    if not os.path.exists(path):
+        return f"Not found: {path}"
+    if os.path.isdir(path):
+        return f"That's a folder: {path}"
+    if not path.lower().endswith(OPEN_EXTS):
+        return "Only .psd, .psb, .ai and .pdf files can be opened."
+    if not os.access(path, os.R_OK):
+        return f"No permission to read {path}"
+    return ""

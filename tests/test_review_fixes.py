@@ -545,6 +545,24 @@ def test_artboard_background_in_rec709():
         assert np.allclose(px[:3], want, atol=1) and px[3] == 255, px
 
 
+def test_pasted_paths():
+    from psdprep import naming
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "my file é.psd")
+        write_psd(rgb_doc(), p)
+        from urllib.parse import quote
+        for pasted in (p, f'  "{p}"  ', f"'{p}'\n", "file://" + quote(p), p + "\nsecond line"):
+            got = naming.clean_pasted_path(pasted)
+            assert got == p and naming.check_open_path(got) == "", (pasted, got)
+        assert "Not found" in naming.check_open_path(naming.clean_pasted_path(p + "x"))
+        assert "folder" in naming.check_open_path(tmp)
+        txt = os.path.join(tmp, "a.txt")
+        open(txt, "w").close()
+        assert "Only" in naming.check_open_path(txt)
+        os.environ["PSDPREP_T"] = tmp
+        assert naming.clean_pasted_path("$PSDPREP_T/my file é.psd") == p
+
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):

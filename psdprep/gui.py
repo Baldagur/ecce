@@ -376,6 +376,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.setMovable(False)
         self.act_open = tb.addAction("Open PSD…", self.open_dialog)
         self.act_open.setShortcut(QtGui.QKeySequence.StandardKey.Open if QT6 else QtGui.QKeySequence.Open)
+        self.txt_path = QtWidgets.QLineEdit()
+        self.txt_path.setPlaceholderText("…or paste a file path here and press Enter")
+        self.txt_path.setClearButtonEnabled(True)
+        self.txt_path.setMinimumWidth(320)
+        self.txt_path.setToolTip("Paste a path (or a file copied in the file manager) and press Enter.\n"
+                                 "Ctrl+V anywhere in the window opens a copied path too.")
+        self.txt_path.returnPressed.connect(self._open_typed_path)
+        tb.addWidget(self.txt_path)
         tb.addSeparator()
         self.act_psd = tb.addAction("Save PSD", lambda: self.export(psd=True, flat=False))
         self.act_flat = tb.addAction("Export flattened", lambda: self.export(psd=False, flat=True))
@@ -680,6 +688,49 @@ class MainWindow(QtWidgets.QMainWindow):
         if ev.mimeData().hasUrls():
             ev.acceptProposedAction()
 
+    def _open_typed_path(self):
+        path = naming.clean_pasted_path(self.txt_path.text())
+        why = naming.check_open_path(path)
+        if why:
+            self.statusBar().showMessage(why, 6000)
+            self.txt_path.selectAll()
+            return
+        self.txt_path.setText(path)
+        self.open(path)
+
+    def _path_from_clipboard(self) -> str:
+        """A supported file path from the clipboard: a copied file (file
+        manager, uri-list) or copied text."""
+        md = QtWidgets.QApplication.clipboard().mimeData()
+        if md is None:
+            return ""
+        if md.hasUrls():
+            for u in md.urls():
+                p = u.toLocalFile()
+                if p and not naming.check_open_path(p):
+                    return p
+        if md.hasText():
+            p = naming.clean_pasted_path(md.text())
+            if not naming.check_open_path(p):
+                return p
+        return ""
+
+    def keyPressEvent(self, ev):
+        # Ctrl+V with a copied path opens it (unless typing in a text field)
+        paste = QtGui.QKeySequence.StandardKey.Paste if QT6 else QtGui.QKeySequence.Paste
+        focus = QtWidgets.QApplication.focusWidget()
+        typing = isinstance(focus, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit,
+                                    QtWidgets.QAbstractSpinBox))
+        if ev.matches(paste) and not typing:
+            p = self._path_from_clipboard()
+            if p:
+                self.txt_path.setText(p)
+                self.open(p)
+                return
+            self.statusBar().showMessage("The clipboard doesn't hold a .psd/.psb/.ai/.pdf path", 5000)
+            return
+        super().keyPressEvent(ev)
+
     def dropEvent(self, ev):
         for u in ev.mimeData().urls():
             p = u.toLocalFile()
@@ -689,6 +740,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open(self, path):
         self.settings.setValue("last_dir", os.path.dirname(path))
+        self.txt_path.setText(path)
         from .vector import is_vector, page_infos, VectorError
         if is_vector(path):
             try:
